@@ -66,8 +66,8 @@ This tool gives you a **complete before/after diff in 30 seconds**, organized by
 ## 🛠️ Installation
 
 ```bash
-pip3 install kubernetes rich
-chmod +x cluster_upgrade_snapshot.py
+pip3 install -r requirements.txt
+chmod +x cluster_upgrade_snapshot_v5.py
 ```
 
 **Requirements:**
@@ -396,3 +396,14 @@ MIT — use it, fork it, ship it.
 
 Built for platform engineering.
 For issues, feedback, or feature requests: open an issue in this repo or ping `#platform-engineering`.
+
+---
+
+## 📝 Tasks Performed (Changelog)
+
+A running log of changes made via Claude Code. Newest entries on top.
+
+### 2026-05-27
+- **Added `requirements.txt`** — pins the two third-party Python dependencies (`kubernetes>=28.1.0`, `rich>=13.0.0`) so the project can be installed with `pip install -r requirements.txt`. `hash_helper.py` is a local module and is not listed.
+- **Updated installation instructions** — README now points to `pip3 install -r requirements.txt` and references the actual script filename (`cluster_upgrade_snapshot_v5.py`) instead of the legacy name.
+- **Added this "Tasks Performed" section** — going forward, every change made through Claude Code will be logged here so the history stays understandable.
