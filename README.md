@@ -394,5 +394,5 @@ MIT — use it, fork it, ship it.
 
 ## 🙋 Author / Contact
 
-Built for platform engineering at TIAA.
+Built for platform engineering.
 For issues, feedback, or feature requests: open an issue in this repo or ping `#platform-engineering`.
