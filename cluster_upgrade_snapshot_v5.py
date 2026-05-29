@@ -1124,28 +1124,48 @@ def _fs_safe(name):
     return "".join(c if (c.isalnum() or c in "-._") else "_" for c in name)
 
 
+def _clean_export_annotations(anns):
+    """hash_helper.clean_annotations (exact/prefix/suffix) + export-only prefixes."""
+    if not isinstance(anns, dict):
+        return {}
+    anns = clean_annotations(anns)
+    return {k: v for k, v in anns.items()
+            if not any(k.startswith(p) for p in EXPORT_EXTRA_NOISY_ANNOTATION_PREFIXES)}
+
+
+def _scrub_metadata(node):
+    """
+    Recursively strip runtime fields + noisy annotations from EVERY ObjectMeta block
+    in a manifest — the top-level metadata AND nested pod/job templates
+    (spec.template.metadata, spec.jobTemplate.spec.template.metadata, ...).
+    Labels are left intact so selectors stay valid. Mutates in place.
+    """
+    if isinstance(node, dict):
+        meta = node.get("metadata")
+        if isinstance(meta, dict):
+            for f in EXPORT_STRIP_METADATA_FIELDS:
+                meta.pop(f, None)
+            if isinstance(meta.get("annotations"), dict):
+                cleaned = _clean_export_annotations(meta["annotations"])
+                if cleaned:
+                    meta["annotations"] = cleaned
+                else:
+                    meta.pop("annotations", None)
+        for v in node.values():
+            _scrub_metadata(v)
+    elif isinstance(node, list):
+        for item in node:
+            _scrub_metadata(item)
+
+
 def clean_object_for_export(obj):
     """
     obj: a camelCase dict (from ApiClient.sanitize_for_serialization, or a raw
-    custom-object dict). Strips status + runtime fields and returns an ordered
-    dict (apiVersion, kind, metadata, ...) ready to write as a manifest.
+    custom-object dict). Strips status + runtime fields (at every nesting level)
+    and returns an ordered dict (apiVersion, kind, metadata, ...) ready to write.
     """
     obj.pop("status", None)
-
-    meta = obj.get("metadata") or {}
-    for f in EXPORT_STRIP_METADATA_FIELDS:
-        meta.pop(f, None)
-
-    anns = meta.get("annotations")
-    if anns:
-        anns = clean_annotations(anns)
-        anns = {k: v for k, v in anns.items()
-                if not any(k.startswith(p) for p in EXPORT_EXTRA_NOISY_ANNOTATION_PREFIXES)}
-        if anns:
-            meta["annotations"] = anns
-        else:
-            meta.pop("annotations", None)
-    obj["metadata"] = meta
+    _scrub_metadata(obj)   # top-level + nested pod/job templates
 
     # Service: clusterIP / nodePort are assigned at runtime when not user-specified.
     if obj.get("kind") == "Service" and isinstance(obj.get("spec"), dict):

@@ -75,6 +75,13 @@ NOISY_ANNOTATION_PREFIXES = (
     "kubernetes.io/change-cause",        # `--record` flag noise
 )
 
+# Annotation key SUFFIXES that are auto-managed. Catches restart markers added by
+# `kubectl/oc rollout restart` under any vendor prefix — e.g.
+# kubectl.kubernetes.io/restartedAt AND openshift.openshift.io/restartedAt.
+NOISY_ANNOTATION_SUFFIXES = (
+    "/restartedAt",
+)
+
 # Labels auto-managed by the platform — change between K8s versions or operators
 NOISY_LABEL_EXACT = frozenset({
     "controller-uid",                    # ReplicaSet → Pod
@@ -134,6 +141,7 @@ def clean_annotations(anns: Optional[Dict[str, str]]) -> Dict[str, str]:
         k: v for k, v in anns.items()
         if k not in NOISY_ANNOTATIONS_EXACT
         and not any(k.startswith(p) for p in NOISY_ANNOTATION_PREFIXES)
+        and not any(k.endswith(s) for s in NOISY_ANNOTATION_SUFFIXES)
     }
 
 
