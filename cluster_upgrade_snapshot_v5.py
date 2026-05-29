@@ -1118,6 +1118,22 @@ EXPORT_STRIP_METADATA_FIELDS = (
     "managedFields", "ownerReferences", "selfLink", "generateName",
 )
 
+# API-server-defaulted pod-spec fields. Dropped ONLY when the value still equals
+# the documented default — a user-customized value (e.g. grace period 60) is kept.
+POD_SPEC_DEFAULTS = {
+    "dnsPolicy":                     "ClusterFirst",
+    "restartPolicy":                 "Always",            # Jobs use OnFailure/Never → untouched
+    "schedulerName":                 "default-scheduler",
+    "terminationGracePeriodSeconds": 30,
+}
+# Per-container defaulted fields (same equals-default rule). imagePullPolicy is
+# intentionally NOT here: its default is tag-dependent (:latest → Always), so
+# dropping it could silently change pull behavior.
+CONTAINER_DEFAULTS = {
+    "terminationMessagePath":   "/dev/termination-log",
+    "terminationMessagePolicy": "File",
+}
+
 
 def _fs_safe(name):
     """K8s names are DNS-1123 safe already; guard against stray chars just in case."""
@@ -1158,14 +1174,52 @@ def _scrub_metadata(node):
             _scrub_metadata(item)
 
 
+def _strip_container_defaults(c):
+    if not isinstance(c, dict):
+        return
+    for field, default in CONTAINER_DEFAULTS.items():
+        if c.get(field) == default:
+            c.pop(field, None)
+    for field in ("resources", "securityContext"):     # API renders these as empty {}
+        if c.get(field) == {}:
+            c.pop(field, None)
+
+
+def _strip_server_defaults(node):
+    """
+    Recursively drop API-server-defaulted fields from pod specs and containers so
+    manifests are minimal. A field is removed ONLY when it still equals its
+    documented default; any user-customized value is preserved. A dict is treated
+    as a PodSpec when it has a `containers` list (true only for pod specs).
+    """
+    if isinstance(node, dict):
+        if isinstance(node.get("containers"), list):
+            for field, default in POD_SPEC_DEFAULTS.items():
+                if node.get(field) == default:
+                    node.pop(field, None)
+            node.pop("serviceAccount", None)            # deprecated alias of serviceAccountName
+            if node.get("securityContext") == {}:
+                node.pop("securityContext", None)
+            for group in ("containers", "initContainers", "ephemeralContainers"):
+                for c in (node.get(group) or []):
+                    _strip_container_defaults(c)
+        for v in node.values():
+            _strip_server_defaults(v)
+    elif isinstance(node, list):
+        for item in node:
+            _strip_server_defaults(item)
+
+
 def clean_object_for_export(obj):
     """
     obj: a camelCase dict (from ApiClient.sanitize_for_serialization, or a raw
     custom-object dict). Strips status + runtime fields (at every nesting level)
-    and returns an ordered dict (apiVersion, kind, metadata, ...) ready to write.
+    and server-applied defaults, returning an ordered dict (apiVersion, kind,
+    metadata, ...) ready to write as a manifest.
     """
     obj.pop("status", None)
-    _scrub_metadata(obj)   # top-level + nested pod/job templates
+    _scrub_metadata(obj)        # top-level + nested pod/job templates
+    _strip_server_defaults(obj) # API-defaulted pod-spec / container fields
 
     # Service: clusterIP / nodePort are assigned at runtime when not user-specified.
     if obj.get("kind") == "Service" and isinstance(obj.get("spec"), dict):
