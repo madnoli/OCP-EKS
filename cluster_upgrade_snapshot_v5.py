@@ -167,7 +167,7 @@ def write_secure(path, content_writer):
     Snapshot data contains namespace names, image refs, sometimes secret hashes —
     not for /tmp world-readable.
     """
-    with open(path, "w", newline="") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         content_writer(f)
     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)   # 0600
 
@@ -1477,8 +1477,8 @@ def diff_pods_table(before, after):
 # DIFF orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 def diff_snapshots(before_file, after_file):
-    with open(before_file) as f: before = json.load(f)
-    with open(after_file)  as f: after  = json.load(f)
+    with open(before_file, encoding="utf-8") as f: before = json.load(f)
+    with open(after_file,  encoding="utf-8") as f: after  = json.load(f)
 
     # NEW in v5: warn if comparing snapshots from incompatible tool versions
     b_ver = before["metadata"].get("snapshot_tool_version", "pre-5.0")

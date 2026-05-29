@@ -403,6 +403,9 @@ For issues, feedback, or feature requests: open an issue in this repo or ping `#
 
 A running log of changes made via Claude Code. Newest entries on top.
 
+### 2026-05-29
+- **Fixed `UnicodeEncodeError` on Windows** — `write_secure()` now opens output files with `encoding="utf-8"`. On Windows, Python defaulted to the cp1252 codec, which crashed when cluster data contained characters like a zero-width space (`​`) — seen while writing the RoleBindings CSV. Also made the `diff` command read JSON snapshots as UTF-8 for cross-platform consistency.
+
 ### 2026-05-27
 - **Added `requirements.txt`** — pins the two third-party Python dependencies (`kubernetes>=28.1.0`, `rich>=13.0.0`) so the project can be installed with `pip install -r requirements.txt`. `hash_helper.py` is a local module and is not listed.
 - **Updated installation instructions** — README now points to `pip3 install -r requirements.txt` and references the actual script filename (`cluster_upgrade_snapshot_v5.py`) instead of the legacy name.
