@@ -1,0 +1,7 @@
+# Cluster snapshot output (JSON + per-resource CSVs)
+snapshot-*
+snapshot_*
+
+# Python
+__pycache__/
+*.py[cod]

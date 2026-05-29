@@ -455,6 +455,7 @@ For issues, feedback, or feature requests: open an issue in this repo or ping `#
 A running log of changes made via Claude Code. Newest entries on top.
 
 ### 2026-05-29
+- **Added `.gitignore`** — ignores snapshot output (`snapshot_*` and `snapshot-*`) so capture artifacts don't get committed, plus Python build artifacts (`__pycache__/`, `*.pyc`).
 - **Added `export` subcommand** — dumps clean, re-applyable YAML manifests, one file per object, foldered as `<output-dir>/<namespace>/<Kind>/<name>.yaml`. Covers all namespaces by default (including `kube-*`/`openshift-*`) across ~20 namespaced kinds plus OpenShift Routes. Strips `status` and all runtime-managed fields (`resourceVersion`, `uid`, `managedFields`, `ownerReferences`, auto-injected annotations, Service `clusterIP`/`nodePort`). Flags: `--namespace`, `--exclude-system`, `--no-secrets`. Secrets are exported with real values by default (files written `0600`); controller-generated objects (SA-token/dockercfg/Helm secrets, root-CA ConfigMaps, CronJob-spawned Jobs) are skipped. Added `pyyaml` to `requirements.txt`.
 - **Fixed `UnicodeEncodeError` on Windows** — `write_secure()` now opens output files with `encoding="utf-8"`. On Windows, Python defaulted to the cp1252 codec, which crashed when cluster data contained characters like a zero-width space (`​`) — seen while writing the RoleBindings CSV. Also made the `diff` command read JSON snapshots as UTF-8 for cross-platform consistency.
 
