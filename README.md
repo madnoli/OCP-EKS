@@ -191,6 +191,57 @@ You'll see a colored, tabular report organized by layer:
 
 ---
 
+## 📤 Export clean YAML manifests (`export`)
+
+Separate from the snapshot/diff flow, the `export` command dumps **clean, re-applyable
+YAML manifests** — one file per object — organized by namespace and kind:
+
+```
+<output-dir>/
+  <namespace>/
+    <Kind>/
+      <name>.yaml
+```
+
+It strips everything the API server / controllers add at runtime, so the output is
+suitable for backup, GitOps seeding, or moving objects between clusters:
+
+- the entire `status` block
+- runtime `metadata`: `resourceVersion`, `uid`, `generation`, `creationTimestamp`,
+  `managedFields`, `ownerReferences`, `selfLink`, `finalizers`, `generateName`
+- auto-injected annotations (last-applied-config, rollout revision, PV bind hints, etc.)
+- auto-assigned Service `clusterIP` / `nodePort`
+
+```bash
+# Every namespace (including kube-* / openshift-*), all supported kinds:
+python3 cluster_upgrade_snapshot_v5.py export --output-dir ./cluster-yaml
+
+# A single namespace:
+python3 cluster_upgrade_snapshot_v5.py export --output-dir ./my-app-yaml --namespace my-app
+
+# Skip system namespaces:
+python3 cluster_upgrade_snapshot_v5.py export --output-dir ./cluster-yaml --exclude-system
+
+# Skip Secrets (by default Secrets ARE exported, with real base64 values):
+python3 cluster_upgrade_snapshot_v5.py export --output-dir ./cluster-yaml --no-secrets
+```
+
+**Exported kinds:** ConfigMap, Secret*, Service, Endpoints, PersistentVolumeClaim,
+ServiceAccount, ResourceQuota, LimitRange, Deployment, StatefulSet, DaemonSet, CronJob,
+Job, Ingress, NetworkPolicy, Role, RoleBinding, HorizontalPodAutoscaler,
+PodDisruptionBudget, and Route (OpenShift).
+
+> ⚠️ **Secrets:** unlike the `capture` command (which only stores hashes), `export`
+> writes **real base64 secret values** so the manifests are re-applyable. Files are
+> written with `0600` permissions — keep the output directory secure. Use `--no-secrets`
+> to skip them.
+
+Controller-generated objects are skipped automatically: SA-token / dockercfg / Helm-release
+Secrets, the `kube-root-ca.crt` / `openshift-service-ca.crt` ConfigMaps, and Jobs spawned
+by CronJobs. Pods and ReplicaSets are not exported (purely runtime).
+
+---
+
 ## 📊 Output formats
 
 | Format | Audience | Use case |
@@ -404,6 +455,7 @@ For issues, feedback, or feature requests: open an issue in this repo or ping `#
 A running log of changes made via Claude Code. Newest entries on top.
 
 ### 2026-05-29
+- **Added `export` subcommand** — dumps clean, re-applyable YAML manifests, one file per object, foldered as `<output-dir>/<namespace>/<Kind>/<name>.yaml`. Covers all namespaces by default (including `kube-*`/`openshift-*`) across ~20 namespaced kinds plus OpenShift Routes. Strips `status` and all runtime-managed fields (`resourceVersion`, `uid`, `managedFields`, `ownerReferences`, auto-injected annotations, Service `clusterIP`/`nodePort`). Flags: `--namespace`, `--exclude-system`, `--no-secrets`. Secrets are exported with real values by default (files written `0600`); controller-generated objects (SA-token/dockercfg/Helm secrets, root-CA ConfigMaps, CronJob-spawned Jobs) are skipped. Added `pyyaml` to `requirements.txt`.
 - **Fixed `UnicodeEncodeError` on Windows** — `write_secure()` now opens output files with `encoding="utf-8"`. On Windows, Python defaulted to the cp1252 codec, which crashed when cluster data contained characters like a zero-width space (`​`) — seen while writing the RoleBindings CSV. Also made the `diff` command read JSON snapshots as UTF-8 for cross-platform consistency.
 
 ### 2026-05-27

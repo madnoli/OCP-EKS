@@ -67,6 +67,12 @@ except ImportError:
     sys.stderr.write("ERROR: 'rich' library not installed.  pip install rich\n")
     sys.exit(2)
 
+try:
+    import yaml
+except ImportError:
+    sys.stderr.write("ERROR: 'PyYAML' not installed.  pip install pyyaml\n")
+    sys.exit(2)
+
 # NEW in v5: import the hash helper. Must be in same directory or PYTHONPATH.
 try:
     from hash_helper import (
@@ -1088,6 +1094,254 @@ def snapshot_cluster(output_dir, label, include_secrets=False):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# YAML EXPORT — dump clean, re-applyable manifests, one file per object,
+# foldered by namespace then Kind:  <output_dir>/<namespace>/<Kind>/<name>.yaml
+#
+# Strips status + everything the API server / controllers add at runtime:
+#   - status (the whole block)
+#   - metadata: resourceVersion, uid, generation, creationTimestamp,
+#     managedFields, ownerReferences, selfLink, finalizers, generateName, ...
+#   - auto-injected annotations (last-applied-config, rollout revision, bind hints)
+#   - auto-assigned Service clusterIP / nodePort
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Runtime annotation prefixes to strip on top of hash_helper's NOISY_ANNOTATION_PREFIXES.
+EXPORT_EXTRA_NOISY_ANNOTATION_PREFIXES = (
+    "pv.kubernetes.io/",
+    "volume.kubernetes.io/",
+    "volume.beta.kubernetes.io/",
+)
+
+EXPORT_STRIP_METADATA_FIELDS = (
+    "resourceVersion", "uid", "generation", "creationTimestamp",
+    "deletionTimestamp", "deletionGracePeriodSeconds", "finalizers",
+    "managedFields", "ownerReferences", "selfLink", "generateName",
+)
+
+
+def _fs_safe(name):
+    """K8s names are DNS-1123 safe already; guard against stray chars just in case."""
+    return "".join(c if (c.isalnum() or c in "-._") else "_" for c in name)
+
+
+def clean_object_for_export(obj):
+    """
+    obj: a camelCase dict (from ApiClient.sanitize_for_serialization, or a raw
+    custom-object dict). Strips status + runtime fields and returns an ordered
+    dict (apiVersion, kind, metadata, ...) ready to write as a manifest.
+    """
+    obj.pop("status", None)
+
+    meta = obj.get("metadata") or {}
+    for f in EXPORT_STRIP_METADATA_FIELDS:
+        meta.pop(f, None)
+
+    anns = meta.get("annotations")
+    if anns:
+        anns = clean_annotations(anns)
+        anns = {k: v for k, v in anns.items()
+                if not any(k.startswith(p) for p in EXPORT_EXTRA_NOISY_ANNOTATION_PREFIXES)}
+        if anns:
+            meta["annotations"] = anns
+        else:
+            meta.pop("annotations", None)
+    obj["metadata"] = meta
+
+    # Service: clusterIP / nodePort are assigned at runtime when not user-specified.
+    if obj.get("kind") == "Service" and isinstance(obj.get("spec"), dict):
+        spec = obj["spec"]
+        spec.pop("clusterIP", None)
+        spec.pop("clusterIPs", None)
+        for port in (spec.get("ports") or []):
+            if isinstance(port, dict):
+                port.pop("nodePort", None)
+
+    ordered = {}
+    for k in ("apiVersion", "kind", "metadata"):
+        if k in obj:
+            ordered[k] = obj[k]
+    for k, v in obj.items():
+        if k not in ordered:
+            ordered[k] = v
+    return ordered
+
+
+def write_yaml_secure(path, obj_dict):
+    """Write one manifest as YAML with 0600 perms (secrets may be present)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    def _writer(f):
+        yaml.safe_dump(obj_dict, f, default_flow_style=False,
+                       sort_keys=False, width=4096, allow_unicode=True)
+    write_secure(path, _writer)
+
+
+def export_cluster_yaml(output_dir, only_namespace=None,
+                        exclude_system=False, include_secrets=True):
+    os.makedirs(output_dir, exist_ok=True)
+    console.print(Panel.fit(
+        f"[bold cyan]Cluster YAML Export v{__version__}[/]"
+        + (f"  •  namespace: [yellow]{only_namespace}[/]" if only_namespace
+           else "  •  [yellow]all namespaces[/]")
+        + ("  •  [grey50]excluding system ns[/]" if exclude_system else "")
+        + ("  •  [red]including secret values[/]" if include_secrets else ""),
+        border_style="cyan",
+    ))
+
+    load_kube_config()
+    core_v1 = client.CoreV1Api()
+    preflight_check(core_v1)
+
+    apps_v1        = client.AppsV1Api()
+    batch_v1       = client.BatchV1Api()
+    rbac_v1        = client.RbacAuthorizationV1Api()
+    networking_v1  = client.NetworkingV1Api()
+    autoscaling_v2 = client.AutoscalingV2Api()
+    policy_v1      = client.PolicyV1Api()
+    custom         = client.CustomObjectsApi()
+    api_client     = client.ApiClient()
+
+    cluster_type = detect_cluster_type(core_v1)
+    console.print(f"  Cluster: [bold]{cluster_type}[/]\n")
+
+    if include_secrets:
+        console.print("[red]⚠ Secret manifests contain real (base64) values. "
+                      "Files are written 0600 — keep the output dir secure.[/]\n")
+
+    # (kind, apiVersion, lister() -> [typed objs], skip(obj) -> bool | None)
+    registry = [
+        ("ConfigMap", "v1",
+         lambda: core_v1.list_config_map_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items,
+         lambda o: o.metadata.name in ("kube-root-ca.crt", "openshift-service-ca.crt")),
+        ("Service", "v1",
+         lambda: core_v1.list_service_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("Endpoints", "v1",
+         lambda: core_v1.list_endpoints_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("PersistentVolumeClaim", "v1",
+         lambda: core_v1.list_persistent_volume_claim_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("ServiceAccount", "v1",
+         lambda: core_v1.list_service_account_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("ResourceQuota", "v1",
+         lambda: core_v1.list_resource_quota_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("LimitRange", "v1",
+         lambda: core_v1.list_limit_range_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("Deployment", "apps/v1",
+         lambda: apps_v1.list_deployment_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("StatefulSet", "apps/v1",
+         lambda: apps_v1.list_stateful_set_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("DaemonSet", "apps/v1",
+         lambda: apps_v1.list_daemon_set_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("CronJob", "batch/v1",
+         lambda: batch_v1.list_cron_job_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("Job", "batch/v1",
+         lambda: batch_v1.list_job_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items,
+         lambda o: any(r.kind == "CronJob" for r in (o.metadata.owner_references or []))),
+        ("Ingress", "networking.k8s.io/v1",
+         lambda: networking_v1.list_ingress_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("NetworkPolicy", "networking.k8s.io/v1",
+         lambda: networking_v1.list_network_policy_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("Role", "rbac.authorization.k8s.io/v1",
+         lambda: rbac_v1.list_role_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("RoleBinding", "rbac.authorization.k8s.io/v1",
+         lambda: rbac_v1.list_role_binding_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("HorizontalPodAutoscaler", "autoscaling/v2",
+         lambda: autoscaling_v2.list_horizontal_pod_autoscaler_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+        ("PodDisruptionBudget", "policy/v1",
+         lambda: policy_v1.list_pod_disruption_budget_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+    ]
+
+    if include_secrets:
+        # Skip controller-generated secrets (SA tokens, dockercfg, Helm release blobs).
+        registry.insert(1, (
+            "Secret", "v1",
+            lambda: core_v1.list_secret_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items,
+            lambda o: o.type in ("kubernetes.io/service-account-token",
+                                 "kubernetes.io/dockercfg",
+                                 "helm.sh/release.v1"),
+        ))
+
+    def want_ns(ns):
+        if only_namespace:
+            return ns == only_namespace
+        if exclude_system and is_system_namespace(ns):
+            return False
+        return True
+
+    counts          = defaultdict(int)
+    namespaces_seen = set()
+    total_files     = 0
+
+    with Progress(SpinnerColumn(),
+                  TextColumn("[progress.description]{task.description}"),
+                  console=console, transient=False) as progress:
+
+        for kind, api_version, lister, skip in registry:
+            t = progress.add_task(f"[cyan]{kind}...", total=None)
+            try:
+                items = lister()
+            except ApiException as e:
+                progress.update(t, description=f"[yellow]⚠ {kind} skipped: {e.reason}", completed=1)
+                continue
+
+            n = 0
+            for obj in items:
+                ns = obj.metadata.namespace
+                if ns is None or not want_ns(ns):
+                    continue
+                if skip and skip(obj):
+                    continue
+                d = api_client.sanitize_for_serialization(obj)
+                d["apiVersion"] = api_version
+                d["kind"]       = kind
+                cleaned = clean_object_for_export(d)
+                path = os.path.join(output_dir, _fs_safe(ns), kind,
+                                    f"{_fs_safe(obj.metadata.name)}.yaml")
+                write_yaml_secure(path, cleaned)
+                namespaces_seen.add(ns)
+                counts[kind] += 1
+                n += 1
+                total_files += 1
+            progress.update(t, description=f"[green]✓ {kind} ({n})", completed=1)
+
+        # OpenShift Routes (custom resource — raw camelCase dicts already)
+        t = progress.add_task("[cyan]Route...", total=None)
+        if cluster_type == "openshift":
+            try:
+                resp = custom.list_cluster_custom_object(
+                    group="route.openshift.io", version="v1", plural="routes",
+                    _request_timeout=API_TIMEOUT_SECONDS)
+                n = 0
+                for route in resp.get("items", []):
+                    ns = route["metadata"]["namespace"]
+                    if not want_ns(ns):
+                        continue
+                    name = route["metadata"]["name"]
+                    route["apiVersion"] = "route.openshift.io/v1"
+                    route["kind"]       = "Route"
+                    cleaned = clean_object_for_export(route)
+                    path = os.path.join(output_dir, _fs_safe(ns), "Route", f"{_fs_safe(name)}.yaml")
+                    write_yaml_secure(path, cleaned)
+                    namespaces_seen.add(ns)
+                    counts["Route"] += 1
+                    n += 1
+                    total_files += 1
+                progress.update(t, description=f"[green]✓ Route ({n})", completed=1)
+            except ApiException as e:
+                progress.update(t, description=f"[yellow]⚠ Route skipped: {e.reason}", completed=1)
+        else:
+            progress.update(t, description="[grey50]– Route skipped (not OpenShift)", completed=1)
+
+    table = Table(title="YAML Export Summary", box=box.ROUNDED, header_style="bold magenta")
+    table.add_column("Kind", style="cyan")
+    table.add_column("Files", justify="right", style="bold yellow")
+    for kind in sorted(counts):
+        table.add_row(kind, str(counts[kind]))
+    table.add_row("[bold]TOTAL", f"[bold]{total_files}")
+    console.print(); console.print(table)
+    console.print(f"\n[green]✓ {total_files} manifests across {len(namespaces_seen)} "
+                  f"namespace(s) written to:[/] [bold]{output_dir}/[/]  [grey50](mode 0600)[/]")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DIFF comparators (return list of (msg, is_critical))
 # UPGRADED in v5: now use spec_hash as primary signal
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1610,12 +1864,28 @@ def main():
     df.add_argument("--before", required=True)
     df.add_argument("--after",  required=True)
 
+    ex = sub.add_parser("export",
+                        help="Export clean, re-applyable YAML manifests (one file per object)")
+    ex.add_argument("--output-dir", required=True,
+                    help="Base dir for the tree: <output-dir>/<namespace>/<Kind>/<name>.yaml")
+    ex.add_argument("--namespace",
+                    help="Limit export to a single namespace (default: all namespaces)")
+    ex.add_argument("--exclude-system", action="store_true",
+                    help="Skip kube-* / openshift-* system namespaces (default: included)")
+    ex.add_argument("--no-secrets", action="store_true",
+                    help="Do NOT export Secrets (default: secrets ARE exported, with real values)")
+
     args = p.parse_args()
     try:
         if args.command == "capture":
             snapshot_cluster(args.output_dir, args.label, include_secrets=args.include_secrets)
         elif args.command == "diff":
             sys.exit(1 if diff_snapshots(args.before, args.after) > 0 else 0)
+        elif args.command == "export":
+            export_cluster_yaml(args.output_dir,
+                                only_namespace=args.namespace,
+                                exclude_system=args.exclude_system,
+                                include_secrets=not args.no_secrets)
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠ Interrupted by user. Partial output may exist.[/]")
         sys.exit(130)
