@@ -645,23 +645,26 @@ def extract_custom_resource(item):
     return {"spec_hash": declared_state_hash(item)}
 
 
-# ── Redis cluster status (exec `redis-cli` inside the pod, no auth) ──────────
+# ── Redis Enterprise health (REC/REDB custom-resource status + rladmin) ──────
+#
+# This is Redis Enterprise (operator app.redislabs.com), NOT OSS Redis Cluster:
+#   - data nodes are a StatefulSet, pods named like rec-0, rec-1, ...
+#   - cluster health lives in the RedisEnterpriseCluster (REC) CR .status
+#   - database health lives in RedisEnterpriseDatabase (REDB) CR .status
+#   - rladmin status (exec'd in any data node) gives the live node/db/shard view
+# OSS `redis-cli CLUSTER INFO` does NOT apply here.
 
-REDIS_EXEC_TIMEOUT = 15
+REDIS_EXEC_TIMEOUT = 20
+REDIS_ENTERPRISE_GROUP = "app.redislabs.com"
+REC_PLURAL  = "redisenterpriseclusters"
+REDB_PLURAL = "redisenterprisedatabases"
+
+REC_HEALTHY_STATES  = {"Running"}
+REDB_HEALTHY_STATUS = {"active"}
 
 
-def _pick_redis_container(pod):
-    """Choose the container to exec into: prefer one whose name/image mentions
-    'redis' (skips sidecars/exporters), else the first container."""
-    containers = pod.spec.containers or []
-    for c in containers:
-        if "redis" in (c.name or "").lower() or "redis" in (c.image or "").lower():
-            return c.name
-    return containers[0].name if containers else None
-
-
-def _redis_exec(core_v1, ns, pod, container, cli_args):
-    """Run `redis-cli <args>` in the pod, return (stdout, error)."""
+def _pod_exec(core_v1, ns, pod, container, command):
+    """Run an arbitrary command in a pod; return (stdout, error)."""
     try:
         from kubernetes.stream import stream
     except ImportError as e:
@@ -669,151 +672,199 @@ def _redis_exec(core_v1, ns, pod, container, cli_args):
     try:
         out = stream(
             core_v1.connect_get_namespaced_pod_exec, pod, ns,
-            command=["redis-cli"] + cli_args, container=container,
+            command=command, container=container,
             stderr=True, stdin=False, stdout=True, tty=False,
             _request_timeout=REDIS_EXEC_TIMEOUT,
         )
         return out, None
     except Exception as e:
-        return None, str(e)[:200]
+        return None, str(e)[:300]
 
 
-def _parse_cluster_info(text):
-    """`CLUSTER INFO` is key:value lines."""
-    d = {}
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if ":" in line:
-            k, v = line.split(":", 1)
-            d[k.strip()] = v.strip()
-    return d
+def _crd_served_version(apiext_v1, group, plural):
+    """Return the storage (or first served) version of a CRD by group+plural, or None."""
+    try:
+        for crd in apiext_v1.list_custom_resource_definition(
+                _request_timeout=API_TIMEOUT_SECONDS).items:
+            if crd.spec.group == group and crd.spec.names.plural == plural:
+                return next((v.name for v in (crd.spec.versions or []) if v.storage), None) \
+                    or next((v.name for v in (crd.spec.versions or []) if v.served), None)
+    except ApiException:
+        pass
+    return None
 
 
-def _parse_cluster_nodes(text):
-    """Count master/replica nodes and connected/disconnected link states from
-    `CLUSTER NODES` output. Returns (masters, replicas, connected, disconnected,
-    myself_role)."""
-    masters = replicas = connected = disconnected = 0
-    myself_role = None
-    for line in (text or "").splitlines():
-        parts = line.split()
-        if len(parts) < 8:
-            continue
-        flags = parts[2]
-        is_master  = "master" in flags
-        is_replica = ("slave" in flags) or ("replica" in flags)
-        if is_master:
-            masters += 1
-        elif is_replica:
-            replicas += 1
-        if parts[7] == "connected":
-            connected += 1
-        else:
-            disconnected += 1
-        if "myself" in flags:
-            myself_role = "master" if is_master else ("replica" if is_replica else None)
-    return masters, replicas, connected, disconnected, myself_role
-
-
-def render_redis_table(redis_data, title="Redis Cluster Status"):
-    """Build a rich table of per-pod Redis status. Used at capture time so the
-    state is visible in BOTH the pre and post runs (not just the diff)."""
-    table = Table(title=title, box=box.ROUNDED, header_style="bold magenta",
-                  title_style="bold cyan", expand=True)
-    table.add_column("Pod (ns/name)", style="cyan", no_wrap=True)
-    table.add_column("Reachable")
-    table.add_column("Cluster State")
-    table.add_column("Slots", justify="right")
-    table.add_column("Size", justify="right")
-    table.add_column("Masters", justify="right")
-    table.add_column("Replicas", justify="right")
-    table.add_column("Disconn.", justify="right")
-    table.add_column("Role")
-
-    if not redis_data:
-        table.add_row("—", "[yellow]no matching pods[/]", "—", "—", "—", "—", "—", "—", "—")
-        return table
-
-    for key in sorted(redis_data):
-        r = redis_data[key]
-        if not r.get("reachable"):
-            table.add_row(key, f"[red]NO[/] [grey50]({r.get('error') or '?'})[/]",
-                          "—", "—", "—", "—", "—", "—", "—")
-            continue
-        state    = r.get("cluster_state") or "—"
-        state_c  = "green" if state == "ok" else "red"
-        disc     = r.get("nodes_disconnected", 0)
-        disc_str = f"[red]{disc}[/]" if disc else "0"
-        table.add_row(
-            key, "[green]YES[/]", f"[{state_c}]{state}[/]",
-            str(r.get("cluster_slots_assigned", "—")),
-            str(r.get("cluster_size", "—")),
-            str(r.get("masters", "—")),
-            str(r.get("replicas", "—")),
-            disc_str,
-            r.get("myself_role") or "—",
-        )
-    return table
-
-
-def extract_redis_status(core_v1, ns, pod, container):
-    """Exec redis-cli CLUSTER INFO + CLUSTER NODES; return a comparable status dict."""
-    info_txt, err = _redis_exec(core_v1, ns, pod, container, ["cluster", "info"])
-    if info_txt is None:
-        return {"reachable": False, "error": err, "container": container}
-
-    info = _parse_cluster_info(info_txt)
-    nodes_txt, _ = _redis_exec(core_v1, ns, pod, container, ["cluster", "nodes"])
-    masters, replicas, conn, disc, myself = _parse_cluster_nodes(nodes_txt)
-
-    def _int(x):
-        try:
-            return int(x)
-        except (TypeError, ValueError):
-            return 0
-
+def extract_rec_status(item):
+    """RedisEnterpriseCluster — operator-maintained .status + desired node count."""
+    spec = item.get("spec") or {}
+    st   = item.get("status") or {}
     return {
-        "reachable":              True,
-        "error":                  None,
-        "container":              container,
-        "cluster_enabled":        info.get("cluster_enabled"),
-        "cluster_state":          info.get("cluster_state"),
-        "cluster_slots_assigned": _int(info.get("cluster_slots_assigned")),
-        "cluster_slots_ok":       _int(info.get("cluster_slots_ok")),
-        "cluster_known_nodes":    _int(info.get("cluster_known_nodes")),
-        "cluster_size":           _int(info.get("cluster_size")),
-        "masters":                masters,
-        "replicas":               replicas,
-        "nodes_connected":        conn,
-        "nodes_disconnected":     disc,
-        "myself_role":            myself,
+        "state":         st.get("state"),                # e.g. 'Running'
+        "desired_nodes": spec.get("nodes"),
+        "license":       (st.get("licenseStatus") or {}).get("activationStatus")
+                         or st.get("licenseStatus"),
+        "redis_version": st.get("redisEnterpriseVersion") or spec.get("redisEnterpriseVersion"),
     }
 
 
-def collect_redis_status(core_v1, pods, name_contains="redis",
-                         namespace=None, ns_filter=None):
-    """Find pods whose name contains `name_contains`, exec redis-cli in each, and
-    return {"<ns>/<pod>": status}. Non-Running pods are recorded as unreachable.
-    Shared by both `capture` and `export`."""
-    sub = (name_contains or "redis").lower()
-    result = {}
-    for p in pods:
-        name = p.metadata.name or ""
-        if sub not in name.lower():
+def extract_redb_status(item):
+    """RedisEnterpriseDatabase — status + shard/replication summary."""
+    spec = item.get("spec") or {}
+    st   = item.get("status") or {}
+    shard_statuses = st.get("shardStatuses") or {}
+    return {
+        "status":            st.get("status"),           # e.g. 'active'
+        "shards":            spec.get("shardCount") or st.get("shards"),
+        "replication":       bool(spec.get("replication")),
+        "redis_version":     st.get("redisVersion") or spec.get("redisVersion"),
+        "internal_endpoints": len(st.get("internalEndpoints") or []),
+        "shard_status_ok":   shard_statuses.get("status") if isinstance(shard_statuses, dict) else None,
+    }
+
+
+def _parse_rladmin_status(text):
+    """Minimal parse of `rladmin status` text: count nodes/dbs/shards and detect
+    any 'down'/'not in sync'/'trimmed' problems. Returns a summary dict."""
+    nodes = dbs = shards = 0
+    issues = []
+    for raw in (text or "").splitlines():
+        line  = raw.strip()
+        lower = line.lower()
+        token = line.lstrip("*").strip()
+        if token.startswith("node:"):
+            nodes += 1
+        elif token.startswith("db:"):
+            dbs += 1
+        elif token.startswith("redis:") or token.startswith("shard:"):
+            shards += 1
+        if any(bad in lower for bad in ("down", "not in sync", "trimmed", "missing", "failed")):
+            issues.append(line[:160])
+    return {"nodes": nodes, "databases": dbs, "shards": shards,
+            "issues": issues[:20], "issue_count": len(issues)}
+
+
+def _is_rec_data_node(name):
+    """rec-0, rec-1, ... are data nodes; skip rec-services-rigger and friends."""
+    import re
+    return bool(re.match(r"^.*-?\d+$", name)) and "rigger" not in name and "operator" not in name
+
+
+def collect_redis_enterprise(core_v1, custom, apiext_v1, pods,
+                             namespace="redis", pod_prefix="rec-"):
+    """Gather Redis Enterprise health into a structured dict:
+       {mode, clusters{ns/name:...}, databases{ns/name:...}, rladmin{ns/pod:...}}.
+    REC/REDB are read from CR .status (no exec). rladmin is exec'd in one data node."""
+    data = {"mode": "enterprise", "clusters": {}, "databases": {}, "rladmin": {}}
+
+    # 1) REC + REDB custom-resource status (structured, no exec)
+    for plural, bucket, extractor in (
+        (REC_PLURAL,  "clusters",  extract_rec_status),
+        (REDB_PLURAL, "databases", extract_redb_status),
+    ):
+        version = _crd_served_version(apiext_v1, REDIS_ENTERPRISE_GROUP, plural)
+        if not version:
             continue
-        ns = p.metadata.namespace
-        if namespace is not None and ns != namespace:
+        try:
+            if namespace:
+                resp = custom.list_namespaced_custom_object(
+                    REDIS_ENTERPRISE_GROUP, version, namespace, plural,
+                    _request_timeout=API_TIMEOUT_SECONDS)
+            else:
+                resp = custom.list_cluster_custom_object(
+                    REDIS_ENTERPRISE_GROUP, version, plural,
+                    _request_timeout=API_TIMEOUT_SECONDS)
+        except Exception:
             continue
-        if ns_filter is not None and not ns_filter(ns):
-            continue
+        for item in (resp.get("items", []) if isinstance(resp, dict) else []):
+            md = item.get("metadata") or {}
+            data[bucket][f"{md.get('namespace')}/{md.get('name')}"] = extractor(item)
+
+    # 2) rladmin status — exec in the first healthy data node (it reports the
+    #    whole cluster, so one node is enough; fall back to the next on failure).
+    candidates = [p for p in pods
+                  if (p.metadata.name or "").startswith(pod_prefix)
+                  and (namespace is None or p.metadata.namespace == namespace)
+                  and _is_rec_data_node(p.metadata.name or "")]
+    candidates.sort(key=lambda p: p.metadata.name)
+    for p in candidates:
+        ns, name = p.metadata.namespace, p.metadata.name
         key = f"{ns}/{name}"
         if p.status.phase != "Running":
-            result[key] = {"reachable": False,
-                           "error": f"pod phase {p.status.phase}", "container": None}
+            data["rladmin"][key] = {"reachable": False,
+                                    "error": f"pod phase {p.status.phase}"}
             continue
-        container = _pick_redis_container(p)
-        result[key] = extract_redis_status(core_v1, ns, name, container)
-    return result
+        container = (p.spec.containers[0].name if p.spec.containers else None)
+        out, err = _pod_exec(core_v1, ns, name, container, ["rladmin", "status"])
+        if out is None:
+            data["rladmin"][key] = {"reachable": False, "error": err}
+            continue
+        parsed = _parse_rladmin_status(out)
+        parsed.update({"reachable": True, "error": None,
+                       "raw_excerpt": out[:4000]})
+        data["rladmin"][key] = parsed
+        break   # one successful node is enough
+    return data
+
+
+def render_redis_tables(redis_data, label=""):
+    """Yield rich tables for Redis Enterprise health (clusters, databases, rladmin)."""
+    suffix = f"  •  {label}" if label else ""
+    tables = []
+
+    # Clusters (REC)
+    ct = Table(title=f"Redis Enterprise — Clusters (REC){suffix}", box=box.ROUNDED,
+               header_style="bold magenta", title_style="bold cyan", expand=True)
+    for col in ("Cluster (ns/name)", "State", "Desired Nodes", "Version"):
+        ct.add_column(col, style="cyan" if col.startswith("Cluster") else None)
+    if redis_data.get("clusters"):
+        for k in sorted(redis_data["clusters"]):
+            c = redis_data["clusters"][k]
+            state = c.get("state") or "—"
+            sc = "green" if state in REC_HEALTHY_STATES else "red"
+            ct.add_row(k, f"[{sc}]{state}[/]", str(c.get("desired_nodes", "—")),
+                       str(c.get("redis_version") or "—"))
+    else:
+        ct.add_row("—", "[yellow]no REC found[/]", "—", "—")
+    tables.append(ct)
+
+    # Databases (REDB)
+    dt = Table(title=f"Redis Enterprise — Databases (REDB){suffix}", box=box.ROUNDED,
+               header_style="bold magenta", title_style="bold cyan", expand=True)
+    for col in ("Database (ns/name)", "Status", "Shards", "Replication", "Version", "Endpoints"):
+        dt.add_column(col, style="cyan" if col.startswith("Database") else None)
+    if redis_data.get("databases"):
+        for k in sorted(redis_data["databases"]):
+            d = redis_data["databases"][k]
+            status = d.get("status") or "—"
+            sc = "green" if status in REDB_HEALTHY_STATUS else "red"
+            dt.add_row(k, f"[{sc}]{status}[/]", str(d.get("shards", "—")),
+                       "yes" if d.get("replication") else "no",
+                       str(d.get("redis_version") or "—"),
+                       str(d.get("internal_endpoints", "—")))
+    else:
+        dt.add_row("—", "[yellow]no REDB found[/]", "—", "—", "—", "—")
+    tables.append(dt)
+
+    # rladmin summary
+    rt = Table(title=f"Redis Enterprise — rladmin status{suffix}", box=box.ROUNDED,
+               header_style="bold magenta", title_style="bold cyan", expand=True)
+    for col in ("Node (ns/pod)", "Reachable", "Nodes", "DBs", "Shards", "Issues"):
+        rt.add_column(col, style="cyan" if col.startswith("Node") else None)
+    if redis_data.get("rladmin"):
+        for k in sorted(redis_data["rladmin"]):
+            r = redis_data["rladmin"][k]
+            if not r.get("reachable"):
+                rt.add_row(k, f"[red]NO[/] [grey50]({(r.get('error') or '?')[:40]})[/]",
+                           "—", "—", "—", "—")
+                continue
+            ic = r.get("issue_count", 0)
+            rt.add_row(k, "[green]YES[/]", str(r.get("nodes", "—")),
+                       str(r.get("databases", "—")), str(r.get("shards", "—")),
+                       f"[red]{ic}[/]" if ic else "0")
+    else:
+        rt.add_row("—", "[yellow]no data node reached[/]", "—", "—", "—", "—")
+    tables.append(rt)
+    return tables
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1032,14 +1083,15 @@ def export_all_csvs(snap, out_dir, prefix):
 # ─────────────────────────────────────────────────────────────────────────────
 def snapshot_cluster(output_dir, label, include_secrets=False,
                      include_custom_resources=False,
-                     redis_check=True, redis_name_contains="redis",
-                     redis_namespace=None):
+                     redis_check=True, redis_namespace="redis",
+                     redis_pod_prefix="rec-"):
     os.makedirs(output_dir, exist_ok=True)
     console.print(Panel.fit(
         f"[bold cyan]Cluster Snapshot v{__version__}[/]  •  label: [yellow]{label}[/]"
         + ("  •  [red]including secrets (hashed)[/]" if include_secrets else "")
         + ("  •  [green]+custom resources[/]" if include_custom_resources else "")
-        + ("  •  [grey50]redis: auto-detect[/]" if redis_check else "  •  [grey50]redis: off[/]"),
+        + ("  •  [grey50]redis-enterprise: auto-detect[/]" if redis_check
+           else "  •  [grey50]redis: off[/]"),
         border_style="cyan",
     ))
 
@@ -1074,8 +1126,8 @@ def snapshot_cluster(output_dir, label, include_secrets=False,
             "include_secrets": include_secrets,
             "include_custom_resources": include_custom_resources,
             "include_redis": False,   # set True below if redis pods are found
-            "redis_name_contains": redis_name_contains,
             "redis_namespace": redis_namespace,
+            "redis_pod_prefix": redis_pod_prefix,
             "snapshot_tool_version": __version__,
         },
         "namespaces":   {"count": 0, "list": []},
@@ -1151,26 +1203,32 @@ def snapshot_cluster(output_dir, label, include_secrets=False,
             })
         progress.update(t, description=f"[green]✓ Pods ({len(pods)})", completed=1)
 
-        # Redis cluster status — runs AUTOMATICALLY when pods whose name contains
-        # `redis_name_contains` are found (no flag needed). Exec's redis-cli per pod
-        # (needs pods/exec). Disable with --no-redis.
+        # Redis Enterprise health — runs AUTOMATICALLY when data-node pods named
+        # like 'rec-' are found (no flag needed). Reads REC/REDB CR status and
+        # exec's `rladmin status` in one data node (needs pods/exec). Disable: --no-redis.
         redis_ran = False
         if redis_check:
-            sub = (redis_name_contains or "redis").lower()
-            matched = [p for p in pods
-                       if sub in (p.metadata.name or "").lower()
-                       and (redis_namespace is None
-                            or p.metadata.namespace == redis_namespace)]
-            if matched:
+            rec_pods = [p for p in pods
+                        if (p.metadata.name or "").startswith(redis_pod_prefix)
+                        and (redis_namespace is None
+                             or p.metadata.namespace == redis_namespace)]
+            # Run if data-node pods exist OR a REC/REDB CRD is present in the ns.
+            has_re_crd = bool(_crd_served_version(apiext_v1, REDIS_ENTERPRISE_GROUP, REC_PLURAL))
+            if rec_pods or has_re_crd:
                 redis_ran = True
                 scope = f" in ns '{redis_namespace}'" if redis_namespace else ""
                 t = progress.add_task(
-                    f"[cyan]Redis status (auto, {len(matched)} pod(s){scope})...", total=None)
-                snap["redis"] = collect_redis_status(core_v1, matched, redis_name_contains)
-                ok = sum(1 for v in snap["redis"].values() if v.get("reachable"))
-                progress.update(t,
-                    description=f"[green]✓ Redis status ({ok}/{len(snap['redis'])} reachable)",
-                    completed=1)
+                    f"[cyan]Redis Enterprise (REC/REDB + rladmin{scope})...", total=None)
+                snap["redis"] = collect_redis_enterprise(
+                    core_v1, custom, apiext_v1, pods,
+                    namespace=redis_namespace, pod_prefix=redis_pod_prefix)
+                nc = len(snap["redis"].get("clusters", {}))
+                nd = len(snap["redis"].get("databases", {}))
+                rl = sum(1 for v in snap["redis"].get("rladmin", {}).values()
+                         if v.get("reachable"))
+                progress.update(t, description=(
+                    f"[green]✓ Redis Enterprise ({nc} cluster(s), {nd} db(s), "
+                    f"rladmin {'ok' if rl else 'unreached'})"), completed=1)
         snap["metadata"]["include_redis"] = redis_ran
 
         t = progress.add_task("[cyan]StatefulSets...", total=None)
@@ -1564,12 +1622,12 @@ def snapshot_cluster(output_dir, label, include_secrets=False,
         table.add_row("1 Platform", "ClusterOps", str(co_count))
     console.print(); console.print(table)
 
-    # Always show the Redis status table when redis pods were found, for BOTH pre
-    # and post captures — so the operator sees the live cluster state at capture time.
+    # Always show the Redis Enterprise tables when detected, for BOTH pre and post
+    # captures — so the operator sees the live cluster state at capture time.
     if redis_ran:
-        console.print()
-        console.print(render_redis_table(snap["redis"],
-                                         title=f"Redis Cluster Status  •  {label}"))
+        for rtbl in render_redis_tables(snap["redis"], label=label):
+            console.print()
+            console.print(rtbl)
 
     console.print(f"\n[green]✓ Files written to:[/] [bold]{output_dir}/[/]  [grey50](mode 0600)[/]")
 
@@ -1753,8 +1811,8 @@ def _is_system_priorityclass(o):
 def export_cluster_yaml(output_dir, only_namespace=None,
                         exclude_system=False, include_secrets=True,
                         include_cluster_scoped=True, include_custom_resources=True,
-                        redis_check=True, redis_name_contains="redis",
-                        redis_namespace=None):
+                        redis_check=True, redis_namespace="redis",
+                        redis_pod_prefix="rec-"):
     os.makedirs(output_dir, exist_ok=True)
     # Cluster-scoped objects are global, not tied to one namespace — skip them when
     # the export is targeted at a single namespace.
@@ -2015,33 +2073,36 @@ def export_cluster_yaml(output_dir, only_namespace=None,
                 progress.update(t, description=f"[green]✓ {kind} ({n}) [grey50]→ {CLUSTER_SCOPED_DIR}/[/]",
                                 completed=1)
 
-        # ── Redis cluster status (auto-detect; written as YAML alongside manifests) ──
-        if redis_check:
-            sub = (redis_name_contains or "redis").lower()
-            t = progress.add_task("[cyan]Redis status (auto)...", total=None)
+        # ── Redis Enterprise health (auto-detect; written as YAML alongside manifests) ──
+        if redis_check and (redis_namespace is None or want_ns(redis_namespace)):
+            t = progress.add_task("[cyan]Redis Enterprise (REC/REDB + rladmin)...", total=None)
             try:
                 all_pods = core_v1.list_pod_for_all_namespaces(
                     _request_timeout=API_TIMEOUT_SECONDS).items
             except ApiException as e:
                 all_pods = []
                 progress.update(t, description=f"[yellow]⚠ Redis skipped: {e.reason}", completed=1)
-            redis_data = collect_redis_status(core_v1, all_pods, redis_name_contains,
-                                              namespace=redis_namespace, ns_filter=want_ns)
-            for rkey, status in redis_data.items():
-                ns, pod = rkey.split("/", 1)
-                doc = {
-                    "apiVersion": "snapshot.local/v1",
-                    "kind":       "RedisClusterStatus",
-                    "metadata":   {"namespace": ns, "name": pod},
-                    "status":     status,
-                }
-                emit(ns, "RedisClusterStatus", pod, doc)
-                namespaces_seen.add(ns)
-            if all_pods:
-                ok = sum(1 for v in redis_data.values() if v.get("reachable"))
-                progress.update(t, description=(
-                    f"[green]✓ Redis status ({ok}/{len(redis_data)} reachable)"
-                    if redis_data else "[grey50]– Redis: no matching pods"), completed=1)
+            re_data = collect_redis_enterprise(core_v1, custom, apiext_v1, all_pods,
+                                               namespace=redis_namespace,
+                                               pod_prefix=redis_pod_prefix)
+            # Each REC, REDB, and rladmin result → its own YAML file under the namespace.
+            for bucket, kind in (("clusters", "RedisEnterpriseClusterStatus"),
+                                 ("databases", "RedisEnterpriseDatabaseStatus"),
+                                 ("rladmin", "RladminStatus")):
+                for rkey, status in re_data.get(bucket, {}).items():
+                    ns, obj = rkey.split("/", 1)
+                    if not want_ns(ns):
+                        continue
+                    doc = {"apiVersion": "snapshot.local/v1", "kind": kind,
+                           "metadata": {"namespace": ns, "name": obj}, "status": status}
+                    emit(ns, kind, obj, doc)
+                    namespaces_seen.add(ns)
+            nc = len(re_data.get("clusters", {}))
+            nd = len(re_data.get("databases", {}))
+            progress.update(t, description=(
+                f"[green]✓ Redis Enterprise ({nc} cluster(s), {nd} db(s))"
+                if (nc or nd or re_data.get("rladmin")) else
+                "[grey50]– Redis: none found"), completed=1)
 
     total_files = stats["total"]
     table = Table(title="YAML Export Summary", box=box.ROUNDED, header_style="bold magenta")
@@ -2435,39 +2496,54 @@ def cmp_custom_resource(b, a):
     return []
 
 
-def cmp_redis(b, a):
+def cmp_rec(b, a):
+    """RedisEnterpriseCluster status comparison."""
+    out = []
+    if b.get("state") != a.get("state"):
+        out.append((f"cluster state: {b.get('state')} → {a.get('state')}",
+                    a.get("state") not in REC_HEALTHY_STATES))
+    if b.get("desired_nodes") != a.get("desired_nodes"):
+        out.append((f"desired nodes: {b.get('desired_nodes')} → {a.get('desired_nodes')}", True))
+    if b.get("redis_version") != a.get("redis_version"):
+        out.append((f"RE version: {b.get('redis_version')} → {a.get('redis_version')}", False))
+    return out
+
+
+def cmp_redb(b, a):
+    """RedisEnterpriseDatabase status comparison."""
+    out = []
+    if b.get("status") != a.get("status"):
+        out.append((f"db status: {b.get('status')} → {a.get('status')}",
+                    a.get("status") not in REDB_HEALTHY_STATUS))
+    if b.get("shards") != a.get("shards"):
+        out.append((f"shards: {b.get('shards')} → {a.get('shards')}", True))
+    if b.get("replication") != a.get("replication"):
+        out.append((f"replication: {b.get('replication')} → {a.get('replication')}", True))
+    if b.get("internal_endpoints") != a.get("internal_endpoints"):
+        out.append((f"endpoints: {b.get('internal_endpoints')} → {a.get('internal_endpoints')}", True))
+    if b.get("redis_version") != a.get("redis_version"):
+        out.append((f"version: {b.get('redis_version')} → {a.get('redis_version')}", False))
+    return out
+
+
+def cmp_rladmin(b, a):
+    """rladmin status comparison (node/db/shard counts + issue count)."""
     out = []
     b_reach, a_reach = b.get("reachable"), a.get("reachable")
-    # Reachability transitions take priority.
     if b_reach and not a_reach:
-        out.append((f"Redis UNREACHABLE after upgrade ({a.get('error') or '?'})", True))
+        out.append((f"rladmin UNREACHABLE after upgrade ({a.get('error') or '?'})", True))
         return out
-    if not b_reach and a_reach:
-        out.append(("Redis now reachable (was not)", False))
-        # fall through to report current health too
     if not a_reach:
-        return out   # both unreachable — nothing more to compare
-
-    if b.get("cluster_state") != a.get("cluster_state"):
-        out.append((f"cluster_state: {b.get('cluster_state')} → {a.get('cluster_state')}",
-                    a.get("cluster_state") != "ok"))
-    if b.get("cluster_slots_assigned") != a.get("cluster_slots_assigned"):
-        out.append((f"slots_assigned: {b.get('cluster_slots_assigned')} → "
-                    f"{a.get('cluster_slots_assigned')}", True))
-    if b.get("cluster_size") != a.get("cluster_size"):
-        out.append((f"cluster_size: {b.get('cluster_size')} → {a.get('cluster_size')}", True))
-    if b.get("cluster_known_nodes") != a.get("cluster_known_nodes"):
-        out.append((f"known_nodes: {b.get('cluster_known_nodes')} → "
-                    f"{a.get('cluster_known_nodes')}", True))
-    if a.get("nodes_disconnected", 0) > b.get("nodes_disconnected", 0):
-        out.append((f"disconnected nodes: {b.get('nodes_disconnected')} → "
-                    f"{a.get('nodes_disconnected')}", True))
-    if b.get("masters") != a.get("masters"):
-        out.append((f"masters: {b.get('masters')} → {a.get('masters')}", True))
-    if b.get("replicas") != a.get("replicas"):
-        out.append((f"replicas: {b.get('replicas')} → {a.get('replicas')}", False))
-    if b.get("myself_role") != a.get("myself_role"):
-        out.append((f"role: {b.get('myself_role')} → {a.get('myself_role')} (failover?)", False))
+        return out
+    if b.get("nodes") != a.get("nodes"):
+        out.append((f"nodes: {b.get('nodes')} → {a.get('nodes')}", True))
+    if b.get("databases") != a.get("databases"):
+        out.append((f"databases: {b.get('databases')} → {a.get('databases')}", True))
+    if b.get("shards") != a.get("shards"):
+        out.append((f"shards: {b.get('shards')} → {a.get('shards')}", True))
+    if a.get("issue_count", 0) > b.get("issue_count", 0):
+        out.append((f"rladmin issues: {b.get('issue_count', 0)} → {a.get('issue_count', 0)} "
+                    f"(e.g. {(a.get('issues') or ['?'])[0]})", True))
     return out
 
 
@@ -2506,7 +2582,9 @@ SECTION_KIND = {
     "[L3] HPAs": "HPA",
     "[L3] PDBs": "PDB",
     "[L3] RESOURCE QUOTAS": "ResourceQuota",
-    "[REDIS] CLUSTER STATUS": "Redis Pod",
+    "[REDIS] CLUSTERS (REC)": "REC",
+    "[REDIS] DATABASES (REDB)": "REDB",
+    "[REDIS] RLADMIN": "Node",
 }
 
 
@@ -2779,15 +2857,22 @@ def diff_snapshots(before_file, after_file, show_unchanged=False):
         issues += c; cr_layer.append((t, n))
         print_layer("CUSTOM RESOURCES", cr_layer)
 
-    # Redis cluster status — shown if EITHER snapshot has it (so redis present
-    # before but gone after still surfaces as MISSING).
+    # Redis Enterprise — shown if EITHER snapshot has it. Three sub-tables:
+    # clusters (REC), databases (REDB), rladmin. The redis dict is nested, so we
+    # pull each bucket out and diff it with diff_cluster_scoped_table.
     redis_layer = []
     if before["metadata"].get("include_redis") or after["metadata"].get("include_redis"):
-        t, c, n = diff_cluster_scoped_table("[REDIS] CLUSTER STATUS",
-                                            before.get("redis", {}), after.get("redis", {}),
-                                            cmp_redis)
-        issues += c; redis_layer.append((t, n))
-        print_layer("REDIS", redis_layer)
+        b_redis = before.get("redis", {}) or {}
+        a_redis = after.get("redis", {}) or {}
+        for title, bucket, fn in [
+            ("[REDIS] CLUSTERS (REC)",   "clusters",  cmp_rec),
+            ("[REDIS] DATABASES (REDB)", "databases", cmp_redb),
+            ("[REDIS] RLADMIN",          "rladmin",   cmp_rladmin),
+        ]:
+            t, c, n = diff_cluster_scoped_table(title, b_redis.get(bucket, {}),
+                                                a_redis.get(bucket, {}), fn)
+            issues += c; redis_layer.append((t, n))
+        print_layer("REDIS ENTERPRISE", redis_layer)
 
     # If nothing changed at all and we're hiding unchanged tables, say so explicitly.
     if not show_unchanged and all(n == 0 for _, n in
@@ -2834,14 +2919,13 @@ def main():
                      help="Also capture Custom Resources via CRD discovery (slower; "
                           "use the SAME flag on both pre and post captures to diff them)")
     cap.add_argument("--no-redis", action="store_true",
-                     help="Skip the Redis cluster check. By DEFAULT it runs automatically "
-                          "whenever pods named like 'redis' are found (needs pods/exec) — no "
-                          "flag needed on pre/post captures.")
-    cap.add_argument("--redis-name-contains", default="redis",
-                     help="Substring to match Redis pod names (default: 'redis')")
-    cap.add_argument("--redis-namespace",
-                     help="Limit the Redis check to this namespace (default: all namespaces). "
-                          "Use it to avoid matching redis-named pods elsewhere, e.g. --redis-namespace redis")
+                     help="Skip the Redis Enterprise check. By DEFAULT it runs automatically "
+                          "(REC/REDB CR status + `rladmin status`) when rec-* data-node pods or "
+                          "a Redis Enterprise CRD are found — no flag needed on pre/post captures.")
+    cap.add_argument("--redis-namespace", default="redis",
+                     help="Namespace of the Redis Enterprise cluster (default: 'redis')")
+    cap.add_argument("--redis-pod-prefix", default="rec-",
+                     help="Name prefix of Redis Enterprise data-node pods (default: 'rec-')")
 
     df = sub.add_parser("diff", help="Diff two snapshot JSON files (rich tables)")
     df.add_argument("--before", required=True)
@@ -2867,12 +2951,12 @@ def main():
                          "CRDs (default: they ARE exported, into _cluster-scoped/). Ignored when "
                          "--namespace is set.")
     ex.add_argument("--no-redis", action="store_true",
-                    help="Do NOT export Redis cluster status (default: auto-detected and written "
-                         "as <ns>/RedisClusterStatus/<pod>.yaml when redis pods are found)")
-    ex.add_argument("--redis-name-contains", default="redis",
-                    help="Substring to match Redis pod names (default: 'redis')")
-    ex.add_argument("--redis-namespace",
-                    help="Limit the Redis check to this namespace (default: all namespaces)")
+                    help="Do NOT export Redis Enterprise status (default: auto-detected; REC/REDB "
+                         "and rladmin status written under <ns>/RedisEnterprise*Status/)")
+    ex.add_argument("--redis-namespace", default="redis",
+                    help="Namespace of the Redis Enterprise cluster (default: 'redis')")
+    ex.add_argument("--redis-pod-prefix", default="rec-",
+                    help="Name prefix of Redis Enterprise data-node pods (default: 'rec-')")
 
     args = p.parse_args()
     try:
@@ -2881,8 +2965,8 @@ def main():
                              include_secrets=args.include_secrets,
                              include_custom_resources=args.include_custom_resources,
                              redis_check=not args.no_redis,
-                             redis_name_contains=args.redis_name_contains,
-                             redis_namespace=args.redis_namespace)
+                             redis_namespace=args.redis_namespace,
+                             redis_pod_prefix=args.redis_pod_prefix)
         elif args.command == "diff":
             sys.exit(1 if diff_snapshots(args.before, args.after,
                                          show_unchanged=args.show_unchanged) > 0 else 0)
@@ -2894,8 +2978,8 @@ def main():
                                 include_cluster_scoped=not args.no_cluster_scoped,
                                 include_custom_resources=not args.no_custom_resources,
                                 redis_check=not args.no_redis,
-                                redis_name_contains=args.redis_name_contains,
-                                redis_namespace=args.redis_namespace)
+                                redis_namespace=args.redis_namespace,
+                                redis_pod_prefix=args.redis_pod_prefix)
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠ Interrupted by user. Partial output may exist.[/]")
         sys.exit(130)
