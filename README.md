@@ -157,6 +157,27 @@ python3 cluster_upgrade_snapshot_v5.py capture \
 > LimitRange, Role, ClusterRole, ClusterRoleBinding, IngressClass, PriorityClass — are always
 > captured, no flag needed.
 
+> **Want to verify Redis cluster health across the upgrade?** Add `--redis` to **both**
+> captures. It finds pods whose name contains `redis` (override with `--redis-name-contains`),
+> exec's `redis-cli CLUSTER INFO` + `CLUSTER NODES` inside each (no auth assumed), and records
+> `cluster_state`, slots assigned, known nodes, cluster size, master/replica counts, and
+> disconnected nodes. The diff shows a `[REDIS] CLUSTER STATUS` table flagging regressions —
+> Redis became unreachable, `cluster_state: ok → fail`, slots/size/masters dropped, or nodes
+> disconnected. Needs `pods/exec` permission. Example:
+>
+> ```bash
+> # Scope to the namespace your Redis lives in (e.g. pods redis-0, redis-1 in ns 'redis'):
+> python3 cluster_upgrade_snapshot_v5.py capture --label pre-upgrade  --output-dir ./chk \
+>     --redis --redis-namespace redis
+> python3 cluster_upgrade_snapshot_v5.py capture --label post-upgrade --output-dir ./chk \
+>     --redis --redis-namespace redis
+> python3 cluster_upgrade_snapshot_v5.py diff \
+>     --before ./chk/snapshot_pre-upgrade.json --after ./chk/snapshot_post-upgrade.json
+> ```
+>
+> Omit `--redis-namespace` to scan every namespace. `--redis-name-contains` defaults to
+> `redis` (matches `redis-0`, `redis-1`, …); change it if your pods are named differently.
+
 ### Step 5 — Diff and verdict
 
 ```bash
@@ -403,6 +424,9 @@ rules:
 - apiGroups: [""]
   resources: ["secrets"]                # only if --include-secrets
   verbs: ["list", "get"]
+- apiGroups: [""]
+  resources: ["pods/exec"]              # only if --redis
+  verbs: ["create", "get"]
 - apiGroups: ["apps"]
   resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
   verbs: ["list", "get"]
@@ -506,6 +530,8 @@ For issues, feedback, or feature requests: open an issue in this repo or ping `#
 A running log of changes made via Claude Code. Newest entries on top.
 
 ### 2026-05-29
+- **Added `--redis-namespace` to scope the Redis check** — limits the Redis pod search to a single namespace (e.g. `--redis-namespace redis` for pods `redis-0`, `redis-1` in the `redis` namespace), so name-substring matching doesn't pick up `redis-*` pods (exporters, sidecars, app clients) elsewhere. Omit it to scan all namespaces. Stored in snapshot metadata.
+- **Added Redis cluster health check across upgrades (`--redis`)** — `capture --redis` finds pods whose name contains `redis` (override via `--redis-name-contains`), exec's `redis-cli CLUSTER INFO` + `CLUSTER NODES` inside each (no auth), and records `cluster_state`, slots assigned/ok, known nodes, cluster size, master/replica counts, connected/disconnected nodes, and this pod's role. The diff renders a `[REDIS] CLUSTER STATUS` table that flags regressions as critical: Redis unreachable after upgrade, `cluster_state: ok → fail`, fewer slots assigned, smaller cluster size, lost masters, or newly disconnected nodes (a master→replica role change is shown as a non-critical failover note). Opt-in and must be set on both pre/post captures (same pattern as `--include-secrets`); needs `pods/exec` RBAC. Implemented via the kubernetes `stream` exec API with a 15s per-call timeout; pods not in `Running` phase are recorded as unreachable. Identification is by pod-name substring per the requested design.
 - **Expanded `capture`/`diff` coverage with 9 more kinds + Custom Resources** — previously `capture`/`diff` only covered 22 categories (some kinds were export-only). Added to the before/after diff: **DaemonSet, Job, ServiceAccount, LimitRange, Role** (namespaced) and **ClusterRole, ClusterRoleBinding, IngressClass, PriorityClass** (cluster-scoped) — all with NEW / MISSING / field-drift detection and noise-stripped `spec_hash` gating. Each got an extractor + comparator (e.g. DaemonSet flags `NOT FULLY SCHEDULED`, PriorityClass flags `value`/`globalDefault` changes, ServiceAccount tracks `imagePullSecrets`/`automount` but ignores auto-generated token secrets). Jobs spawned by CronJobs and `system:*`/built-in cluster objects are filtered as noise. **Custom Resources** are now also diffable via `capture --include-custom-resources` (auto-discovers CRDs, hashes each CR's declared state, skips status churn) — shown in a dedicated `[CR] CUSTOM RESOURCES` table; both pre and post captures must use the flag (same pattern as `--include-secrets`). New `diff_custom_resources_table`; `diff_snapshots` reads new keys defensively with `.get()` so it still compares older snapshots.
 - **Diff "Name" column now names the resource kind** — each diff table's Name column header reads the actual Kind (e.g. `Deployment Name`, `ConfigMap Name`, `Service Name`) instead of a generic `Name`, so it's clear what the listed names are. Driven by a `SECTION_KIND` title→kind map; unknown sections fall back to `Name`.
 - **`diff` now hides unchanged resource categories by default** — previously the report printed a "No changes" table for every one of the 22 categories, burying the actual findings. The three table builders (`diff_ns_scoped_table`, `diff_cluster_scoped_table`, `diff_pods_table`) now also return a findings count, and `diff_snapshots` only prints tables (and their layer header) when there's at least one change. If nothing changed anywhere, it prints a single `✓ No changes detected` line. Use `--show-unchanged` to restore the full all-categories output. The PASS/FAIL verdict and exit code are unaffected.
