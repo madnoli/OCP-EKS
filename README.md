@@ -226,10 +226,37 @@ python3 cluster_upgrade_snapshot_v5.py export --output-dir ./cluster-yaml --excl
 python3 cluster_upgrade_snapshot_v5.py export --output-dir ./cluster-yaml --no-secrets
 ```
 
-**Exported kinds:** ConfigMap, Secret*, Service, Endpoints, PersistentVolumeClaim,
+**Exported namespaced kinds:** ConfigMap, Secret*, Service, Endpoints, PersistentVolumeClaim,
 ServiceAccount, ResourceQuota, LimitRange, Deployment, StatefulSet, DaemonSet, CronJob,
 Job, Ingress, NetworkPolicy, Role, RoleBinding, HorizontalPodAutoscaler,
 PodDisruptionBudget, and Route (OpenShift).
+
+**Custom Resources (default ON):** every namespaced Custom Resource is auto-discovered by
+listing the cluster's CRDs and dumping each CR's storage version — so operator-managed
+objects (cert-manager `Certificate`, ArgoCD `Application`, Prometheus, vendor CRs, etc.)
+are included. Disable with `--no-custom-resources`.
+
+**Cluster-scoped objects (default ON, into `_cluster-scoped/`):** Namespace, ClusterRole,
+ClusterRoleBinding, StorageClass, PriorityClass, IngressClass, CustomResourceDefinition,
+plus any cluster-scoped Custom Resources. Cluster-managed defaults are skipped
+(`system:*` ClusterRoles, the two built-in PriorityClasses). Disable with
+`--no-cluster-scoped`. (Automatically skipped when `--namespace` is set, since it targets
+one namespace.) Nodes and PersistentVolumes are intentionally excluded — they're
+environment-specific and not portable.
+
+```bash
+# Full backup: all namespaces, all CRs, plus cluster-scoped objects (the defaults):
+python3 cluster_upgrade_snapshot_v5.py export --output-dir ./cluster-yaml
+
+# Just the built-in namespaced kinds (skip CRs + cluster-scoped):
+python3 cluster_upgrade_snapshot_v5.py export --output-dir ./cluster-yaml \
+    --no-custom-resources --no-cluster-scoped
+```
+
+> **Note:** full discovery makes one API list call per CRD (can be 100–300 on OpenShift),
+> so a complete export takes longer than the curated-only run. CRD kinds that can't be
+> listed (aggregated API down, RBAC denied, conversion webhook unavailable) are counted as
+> "unavailable" and skipped, not fatal.
 
 > ⚠️ **Secrets:** unlike the `capture` command (which only stores hashes), `export`
 > writes **real base64 secret values** so the manifests are re-applyable. Files are
@@ -455,6 +482,8 @@ For issues, feedback, or feature requests: open an issue in this repo or ping `#
 A running log of changes made via Claude Code. Newest entries on top.
 
 ### 2026-05-29
+- **Export now covers Custom Resources + cluster-scoped objects (near-full backup)** — the `export` command was extended beyond the 18 curated namespaced kinds. It now (a) auto-discovers every Custom Resource by listing the cluster's CRDs and dumping each CR's storage version across all namespaces (operator-managed objects: cert-manager, ArgoCD, Prometheus, vendor CRs, etc.), and (b) exports cluster-scoped objects — Namespace, ClusterRole, ClusterRoleBinding, StorageClass, PriorityClass, IngressClass, CustomResourceDefinition, and cluster-scoped CRs — into a top-level `_cluster-scoped/` folder. Both are ON by default; opt out with `--no-custom-resources` / `--no-cluster-scoped` (the latter is auto-skipped when `--namespace` targets a single namespace). Cluster-managed defaults (`system:*` ClusterRoles, built-in PriorityClasses) are filtered out; Nodes/PVs are intentionally excluded as environment-specific. CRD kinds that can't be listed (aggregated API down, RBAC, conversion webhook) are counted as "unavailable" and skipped rather than aborting. Needs broader read RBAC than the curated export.
+- **Suppressed repeated `InsecureRequestWarning` spam** — when the kubeconfig sets `insecure-skip-tls-verify` (common on internal OCP clusters with self-signed certs), urllib3 printed a multi-line warning on *every* API call, flooding the output. `load_kube_config()` now disables that one warning — but only when TLS verification is actually off — and prints a single grey notice instead, so the security trade-off stays visible. Verification-enabled clusters are unaffected.
 - **Fixed Python 3.6 compatibility (`TypeError: __init__() got an unexpected keyword argument 'required'`)** — `argparse.add_subparsers()` only accepts `required=` on Python 3.7+, but RHEL/OCP nodes commonly ship Python 3.6.8. Now sets `sub.required = True` via the attribute instead of the constructor kwarg, so the script runs on 3.6 as well. (The `required=True` args on individual `add_argument()` calls are fine on all versions.)
 - **Strip server-applied defaults from exported manifests** — the `export` cleaner now drops API-server-defaulted pod-spec fields (`dnsPolicy: ClusterFirst`, `restartPolicy: Always`, `schedulerName: default-scheduler`, `terminationGracePeriodSeconds: 30`), per-container defaults (`terminationMessagePath: /dev/termination-log`, `terminationMessagePolicy: File`, empty `resources: {}`/`securityContext: {}`), and the deprecated `serviceAccount` alias. Fields are removed ONLY when the value still equals the documented default — a customized value (e.g. `terminationGracePeriodSeconds: 60`) is preserved. `serviceAccountName`, non-empty `securityContext`, and `imagePullSecrets` are kept; `imagePullPolicy` is deliberately NOT stripped (its default is tag-dependent).
 - **Stripped runtime annotations from nested pod/job templates** — `restartedAt` markers (from `kubectl/oc rollout restart`) live in `spec.template.metadata.annotations`, which the export cleaner previously left untouched (it only scrubbed top-level `metadata`). The export cleaner is now recursive: it walks every nested `ObjectMeta` block (pod template, CronJob jobTemplate, etc.) and strips runtime fields + auto-managed annotations, while leaving labels intact so selectors stay valid. Also added a `/restartedAt` annotation-suffix rule to `hash_helper.clean_annotations` so it catches `openshift.openshift.io/restartedAt` (and any vendor's restart marker), not just the `kubectl.kubernetes.io/` one — this benefits the `capture`/`diff` hashing too. Note: chart-author annotations like `rollme` are kept (not Kubernetes-generated).

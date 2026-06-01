@@ -119,6 +119,29 @@ def load_kube_config():
         config.load_incluster_config()
     except config.ConfigException:
         config.load_kube_config()
+    _silence_insecure_tls_warnings()
+
+
+def _silence_insecure_tls_warnings():
+    """
+    When the kubeconfig sets insecure-skip-tls-verify (common on internal OCP
+    clusters with self-signed certs), urllib3 prints an InsecureRequestWarning on
+    EVERY API call — hundreds of lines of noise. Suppress that single warning, but
+    only when verification is actually disabled, and print one notice so the
+    security trade-off stays visible.
+    """
+    try:
+        verify_ssl = client.Configuration.get_default_copy().verify_ssl
+    except Exception:
+        verify_ssl = True
+    if not verify_ssl:
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
+        console.print("[grey50]Note: TLS verification is disabled in your kubeconfig "
+                      "(insecure-skip-tls-verify). Suppressing repeated urllib3 warnings.[/]")
 
 
 def preflight_check(core_v1):
@@ -1249,14 +1272,40 @@ def write_yaml_secure(path, obj_dict):
     write_secure(path, _writer)
 
 
+# Cluster-scoped objects go in this top-level folder (they have no namespace).
+CLUSTER_SCOPED_DIR = "_cluster-scoped"
+
+# CRD groups we already capture via a dedicated path — skip in generic CR discovery
+# to avoid duplicate files. (Routes are a native/aggregated API, handled separately.)
+CR_DISCOVERY_SKIP_GROUPS = frozenset({"route.openshift.io"})
+
+
+def _is_system_cluster_rbac(o):
+    """ClusterRole/ClusterRoleBinding that the cluster manages itself (not user config)."""
+    name = o.metadata.name or ""
+    labels = o.metadata.labels or {}
+    return (name.startswith("system:")
+            or labels.get("kubernetes.io/bootstrapping") == "rbac-defaults")
+
+
+def _is_system_priorityclass(o):
+    return o.metadata.name in ("system-node-critical", "system-cluster-critical")
+
+
 def export_cluster_yaml(output_dir, only_namespace=None,
-                        exclude_system=False, include_secrets=True):
+                        exclude_system=False, include_secrets=True,
+                        include_cluster_scoped=True, include_custom_resources=True):
     os.makedirs(output_dir, exist_ok=True)
+    # Cluster-scoped objects are global, not tied to one namespace — skip them when
+    # the export is targeted at a single namespace.
+    cs_enabled = include_cluster_scoped and not only_namespace
     console.print(Panel.fit(
         f"[bold cyan]Cluster YAML Export v{__version__}[/]"
         + (f"  •  namespace: [yellow]{only_namespace}[/]" if only_namespace
            else "  •  [yellow]all namespaces[/]")
         + ("  •  [grey50]excluding system ns[/]" if exclude_system else "")
+        + ("  •  [green]+custom resources[/]" if include_custom_resources else "")
+        + ("  •  [green]+cluster-scoped[/]" if cs_enabled else "")
         + ("  •  [red]including secret values[/]" if include_secrets else ""),
         border_style="cyan",
     ))
@@ -1271,6 +1320,9 @@ def export_cluster_yaml(output_dir, only_namespace=None,
     networking_v1  = client.NetworkingV1Api()
     autoscaling_v2 = client.AutoscalingV2Api()
     policy_v1      = client.PolicyV1Api()
+    storage_v1     = client.StorageV1Api()
+    scheduling_v1  = client.SchedulingV1Api()
+    apiext_v1      = client.ApiextensionsV1Api()
     custom         = client.CustomObjectsApi()
     api_client     = client.ApiClient()
 
@@ -1342,12 +1394,19 @@ def export_cluster_yaml(output_dir, only_namespace=None,
 
     counts          = defaultdict(int)
     namespaces_seen = set()
-    total_files     = 0
+    stats           = {"total": 0}
+
+    def emit(folder, kind, name, cleaned):
+        path = os.path.join(output_dir, _fs_safe(folder), kind, f"{_fs_safe(str(name))}.yaml")
+        write_yaml_secure(path, cleaned)
+        counts[kind]  += 1
+        stats["total"] += 1
 
     with Progress(SpinnerColumn(),
                   TextColumn("[progress.description]{task.description}"),
                   console=console, transient=False) as progress:
 
+        # ── Namespaced built-in kinds ──────────────────────────────────────
         for kind, api_version, lister, skip in registry:
             t = progress.add_task(f"[cyan]{kind}...", total=None)
             try:
@@ -1366,17 +1425,12 @@ def export_cluster_yaml(output_dir, only_namespace=None,
                 d = api_client.sanitize_for_serialization(obj)
                 d["apiVersion"] = api_version
                 d["kind"]       = kind
-                cleaned = clean_object_for_export(d)
-                path = os.path.join(output_dir, _fs_safe(ns), kind,
-                                    f"{_fs_safe(obj.metadata.name)}.yaml")
-                write_yaml_secure(path, cleaned)
+                emit(ns, kind, obj.metadata.name, clean_object_for_export(d))
                 namespaces_seen.add(ns)
-                counts[kind] += 1
                 n += 1
-                total_files += 1
             progress.update(t, description=f"[green]✓ {kind} ({n})", completed=1)
 
-        # OpenShift Routes (custom resource — raw camelCase dicts already)
+        # ── OpenShift Routes (native API — not a CRD, so discovery misses them) ──
         t = progress.add_task("[cyan]Route...", total=None)
         if cluster_type == "openshift":
             try:
@@ -1388,22 +1442,120 @@ def export_cluster_yaml(output_dir, only_namespace=None,
                     ns = route["metadata"]["namespace"]
                     if not want_ns(ns):
                         continue
-                    name = route["metadata"]["name"]
                     route["apiVersion"] = "route.openshift.io/v1"
                     route["kind"]       = "Route"
-                    cleaned = clean_object_for_export(route)
-                    path = os.path.join(output_dir, _fs_safe(ns), "Route", f"{_fs_safe(name)}.yaml")
-                    write_yaml_secure(path, cleaned)
+                    emit(ns, "Route", route["metadata"]["name"], clean_object_for_export(route))
                     namespaces_seen.add(ns)
-                    counts["Route"] += 1
                     n += 1
-                    total_files += 1
                 progress.update(t, description=f"[green]✓ Route ({n})", completed=1)
             except ApiException as e:
                 progress.update(t, description=f"[yellow]⚠ Route skipped: {e.reason}", completed=1)
         else:
             progress.update(t, description="[grey50]– Route skipped (not OpenShift)", completed=1)
 
+        # ── Namespaced + cluster-scoped Custom Resources (via CRD discovery) ──
+        if include_custom_resources:
+            t = progress.add_task("[cyan]Custom Resources (discovering CRDs)...", total=None)
+            try:
+                crds = apiext_v1.list_custom_resource_definition(
+                    _request_timeout=API_TIMEOUT_SECONDS).items
+            except ApiException as e:
+                crds = []
+                progress.update(t, description=f"[yellow]⚠ CRD discovery failed: {e.reason}", completed=1)
+
+            cr_objs = cr_kinds = cr_unavailable = 0
+            for crd in crds:
+                group = crd.spec.group
+                if group in CR_DISCOVERY_SKIP_GROUPS:
+                    continue
+                scope = crd.spec.scope
+                if scope != "Namespaced" and not cs_enabled:
+                    continue
+                # Prefer the storage version; fall back to the first served version.
+                version = next((v.name for v in (crd.spec.versions or []) if v.storage), None) \
+                    or next((v.name for v in (crd.spec.versions or []) if v.served), None)
+                if not version:
+                    continue
+                kind   = crd.spec.names.kind
+                plural = crd.spec.names.plural
+                try:
+                    resp = custom.list_cluster_custom_object(
+                        group=group, version=version, plural=plural,
+                        _request_timeout=API_TIMEOUT_SECONDS)
+                except Exception:
+                    cr_unavailable += 1          # aggregated API down, RBAC, conversion webhook, etc.
+                    continue
+                items = resp.get("items", []) if isinstance(resp, dict) else []
+                api_version = f"{group}/{version}"
+                produced = False
+                for item in items:
+                    md   = item.get("metadata") or {}
+                    name = md.get("name")
+                    ns   = md.get("namespace")
+                    item["apiVersion"] = api_version
+                    item["kind"]       = kind
+                    cleaned = clean_object_for_export(item)
+                    if ns:
+                        if not want_ns(ns):
+                            continue
+                        emit(ns, kind, name, cleaned)
+                        namespaces_seen.add(ns)
+                    else:
+                        if not cs_enabled:
+                            continue
+                        emit(CLUSTER_SCOPED_DIR, kind, name, cleaned)
+                    cr_objs += 1
+                    produced = True
+                if produced:
+                    cr_kinds += 1
+            if crds:
+                progress.update(t, description=(
+                    f"[green]✓ Custom Resources ({cr_objs} objects, {cr_kinds} kinds"
+                    + (f"; {cr_unavailable} kinds unavailable" if cr_unavailable else "")
+                    + ")"), completed=1)
+
+        # ── Cluster-scoped built-in kinds ──────────────────────────────────
+        if cs_enabled:
+            cluster_registry = [
+                ("Namespace", "v1",
+                 lambda: core_v1.list_namespace(_request_timeout=API_TIMEOUT_SECONDS).items,
+                 (lambda o: exclude_system and is_system_namespace(o.metadata.name))),
+                ("ClusterRole", "rbac.authorization.k8s.io/v1",
+                 lambda: rbac_v1.list_cluster_role(_request_timeout=API_TIMEOUT_SECONDS).items,
+                 _is_system_cluster_rbac),
+                ("ClusterRoleBinding", "rbac.authorization.k8s.io/v1",
+                 lambda: rbac_v1.list_cluster_role_binding(_request_timeout=API_TIMEOUT_SECONDS).items,
+                 _is_system_cluster_rbac),
+                ("StorageClass", "storage.k8s.io/v1",
+                 lambda: storage_v1.list_storage_class(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+                ("PriorityClass", "scheduling.k8s.io/v1",
+                 lambda: scheduling_v1.list_priority_class(_request_timeout=API_TIMEOUT_SECONDS).items,
+                 _is_system_priorityclass),
+                ("IngressClass", "networking.k8s.io/v1",
+                 lambda: networking_v1.list_ingress_class(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+                ("CustomResourceDefinition", "apiextensions.k8s.io/v1",
+                 lambda: apiext_v1.list_custom_resource_definition(_request_timeout=API_TIMEOUT_SECONDS).items, None),
+            ]
+            for kind, api_version, lister, skip in cluster_registry:
+                t = progress.add_task(f"[cyan]{kind}...", total=None)
+                try:
+                    items = lister()
+                except ApiException as e:
+                    progress.update(t, description=f"[yellow]⚠ {kind} skipped: {e.reason}", completed=1)
+                    continue
+                n = 0
+                for obj in items:
+                    if skip and skip(obj):
+                        continue
+                    d = api_client.sanitize_for_serialization(obj)
+                    d["apiVersion"] = api_version
+                    d["kind"]       = kind
+                    emit(CLUSTER_SCOPED_DIR, kind, obj.metadata.name, clean_object_for_export(d))
+                    n += 1
+                progress.update(t, description=f"[green]✓ {kind} ({n}) [grey50]→ {CLUSTER_SCOPED_DIR}/[/]",
+                                completed=1)
+
+    total_files = stats["total"]
     table = Table(title="YAML Export Summary", box=box.ROUNDED, header_style="bold magenta")
     table.add_column("Kind", style="cyan")
     table.add_column("Files", justify="right", style="bold yellow")
@@ -1413,6 +1565,8 @@ def export_cluster_yaml(output_dir, only_namespace=None,
     console.print(); console.print(table)
     console.print(f"\n[green]✓ {total_files} manifests across {len(namespaces_seen)} "
                   f"namespace(s) written to:[/] [bold]{output_dir}/[/]  [grey50](mode 0600)[/]")
+    if cs_enabled:
+        console.print(f"[grey50]  cluster-scoped objects → {output_dir}/{CLUSTER_SCOPED_DIR}/[/]")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1951,6 +2105,12 @@ def main():
                     help="Skip kube-* / openshift-* system namespaces (default: included)")
     ex.add_argument("--no-secrets", action="store_true",
                     help="Do NOT export Secrets (default: secrets ARE exported, with real values)")
+    ex.add_argument("--no-custom-resources", action="store_true",
+                    help="Do NOT discover/export Custom Resources (default: CRs ARE exported)")
+    ex.add_argument("--no-cluster-scoped", action="store_true",
+                    help="Do NOT export cluster-scoped objects like ClusterRoles, StorageClasses, "
+                         "CRDs (default: they ARE exported, into _cluster-scoped/). Ignored when "
+                         "--namespace is set.")
 
     args = p.parse_args()
     try:
@@ -1962,7 +2122,9 @@ def main():
             export_cluster_yaml(args.output_dir,
                                 only_namespace=args.namespace,
                                 exclude_system=args.exclude_system,
-                                include_secrets=not args.no_secrets)
+                                include_secrets=not args.no_secrets,
+                                include_cluster_scoped=not args.no_cluster_scoped,
+                                include_custom_resources=not args.no_custom_resources)
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠ Interrupted by user. Partial output may exist.[/]")
         sys.exit(130)
