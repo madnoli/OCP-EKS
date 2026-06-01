@@ -1885,7 +1885,7 @@ def diff_ns_scoped_table(title, before_section, after_section, common_ns, compar
             icon = "[red]✗[/]" if crit else "[yellow]•[/]"
             table.add_row(icon, ns, name, f"[{color}]{msg}[/]")
             if crit: critical_count += 1
-    return table, critical_count
+    return table, critical_count, len(findings)
 
 
 def diff_cluster_scoped_table(title, before_section, after_section, compare_fn):
@@ -1912,7 +1912,7 @@ def diff_cluster_scoped_table(title, before_section, after_section, compare_fn):
             icon = "[red]✗[/]" if crit else "[yellow]•[/]"
             table.add_row(icon, name, f"[{color}]{msg}[/]")
             if crit: critical_count += 1
-    return table, critical_count
+    return table, critical_count, len(findings)
 
 
 def diff_pods_table(before, after):
@@ -1952,15 +1952,26 @@ def diff_pods_table(before, after):
         for key, msg, crit in findings:
             table.add_row("[red]✗[/]" if crit else "[yellow]•[/]", key, msg)
             if crit: critical_count += 1
-    return table, critical_count
+    return table, critical_count, len(findings)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DIFF orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
-def diff_snapshots(before_file, after_file):
+def diff_snapshots(before_file, after_file, show_unchanged=False):
     with open(before_file, encoding="utf-8") as f: before = json.load(f)
     with open(after_file,  encoding="utf-8") as f: after  = json.load(f)
+
+    def print_layer(header_text, tables):
+        """tables: list of (table, n_findings). Prints the layer header + only the
+        tables that have findings. By default a layer with zero changes is hidden
+        entirely; --show-unchanged restores the full output."""
+        visible = [tbl for tbl, n in tables if show_unchanged or n > 0]
+        if not visible:
+            return
+        console.print(Panel.fit(f"[bold yellow]{header_text}[/]", border_style="yellow"))
+        for tbl in visible:
+            console.print(tbl)
 
     # NEW in v5: warn if comparing snapshots from incompatible tool versions
     b_ver = before["metadata"].get("snapshot_tool_version", "pre-5.0")
@@ -1984,7 +1995,7 @@ def diff_snapshots(before_file, after_file):
     issues = 0
 
     # LAYER 1: Platform
-    console.print(Panel.fit("[bold yellow]LAYER 1 — PLATFORM[/]", border_style="yellow"))
+    layer1 = []
     for title, key, fn in [
         ("[L1] NODES",               "nodes",           cmp_node),
         ("[L1] PERSISTENT VOLUMES",  "pvs",             cmp_pv),
@@ -1992,30 +2003,29 @@ def diff_snapshots(before_file, after_file):
         ("[L1] CRDs",                "crds",            cmp_crd),
         ("[L1] API SERVICES",        "apiservices",     cmp_apiservice),
     ]:
-        t, c = diff_cluster_scoped_table(title, before[key], after[key], fn)
-        console.print(t); issues += c
+        t, c, n = diff_cluster_scoped_table(title, before[key], after[key], fn)
+        issues += c; layer1.append((t, n))
 
     if before["metadata"]["cluster_type"] == "openshift":
-        t, c = diff_cluster_scoped_table("[L1] CLUSTER OPERATORS",
-                                         before["clusteroperators"], after["clusteroperators"],
-                                         cmp_clusteroperator)
-        console.print(t); issues += c
+        t, c, n = diff_cluster_scoped_table("[L1] CLUSTER OPERATORS",
+                                            before["clusteroperators"], after["clusteroperators"],
+                                            cmp_clusteroperator)
+        issues += c; layer1.append((t, n))
+    print_layer("LAYER 1 — PLATFORM", layer1)
 
     # LAYER 2: Configuration
-    console.print(Panel.fit("[bold yellow]LAYER 2 — CONFIGURATION[/]", border_style="yellow"))
-
     ns_table = Table(title="[L2] NAMESPACES", box=box.ROUNDED,
                      header_style="bold magenta", title_style="bold cyan", expand=True)
     ns_table.add_column("", width=2); ns_table.add_column("Namespace", style="cyan")
     ns_table.add_column("Change")
+    ns_n = 0
     if before_ns == after_ns:
         ns_table.add_row("[green]✓[/]", "—", f"[green]No change ({len(before_ns)} namespaces)[/]")
     else:
         for ns in sorted(before_ns - after_ns):
-            ns_table.add_row("[red]✗[/]", ns, "[red]REMOVED[/]"); issues += 1
+            ns_table.add_row("[red]✗[/]", ns, "[red]REMOVED[/]"); issues += 1; ns_n += 1
         for ns in sorted(after_ns - before_ns):
-            ns_table.add_row("[green]+[/]", ns, "[green]ADDED[/]")
-    console.print(ns_table)
+            ns_table.add_row("[green]+[/]", ns, "[green]ADDED[/]"); ns_n += 1
 
     layer2_sections = [
         ("[L2] CONFIGMAPS",       "configmaps",      cmp_configmap),
@@ -2030,19 +2040,20 @@ def diff_snapshots(before_file, after_file):
     if before["metadata"].get("include_secrets") and after["metadata"].get("include_secrets"):
         layer2_sections.append(("[L2] SECRETS (hashed)", "secrets", cmp_secret))
 
+    layer2 = [(ns_table, ns_n)]
     for title, key, fn in layer2_sections:
-        t, c = diff_ns_scoped_table(title, before[key], after[key], common_ns, fn)
-        console.print(t); issues += c
+        t, c, n = diff_ns_scoped_table(title, before[key], after[key], common_ns, fn)
+        issues += c; layer2.append((t, n))
+    print_layer("LAYER 2 — CONFIGURATION", layer2)
 
     # LAYER 3: Workloads
-    console.print(Panel.fit("[bold yellow]LAYER 3 — WORKLOADS[/]", border_style="yellow"))
+    layer3 = []
+    t, c, n = diff_ns_scoped_table("[L3] DEPLOYMENTS",
+                                   before["deployments"], after["deployments"], common_ns, cmp_deployment)
+    issues += c; layer3.append((t, n))
 
-    t, c = diff_ns_scoped_table("[L3] DEPLOYMENTS",
-                                before["deployments"], after["deployments"], common_ns, cmp_deployment)
-    console.print(t); issues += c
-
-    t, c = diff_pods_table(before, after)
-    console.print(t); issues += c
+    t, c, n = diff_pods_table(before, after)
+    issues += c; layer3.append((t, n))
 
     for title, key, fn in [
         ("[L3] STATEFULSETS",    "statefulsets",   cmp_statefulset),
@@ -2051,8 +2062,13 @@ def diff_snapshots(before_file, after_file):
         ("[L3] PDBs",            "pdbs",           cmp_pdb),
         ("[L3] RESOURCE QUOTAS", "resourcequotas", cmp_resourcequota),
     ]:
-        t, c = diff_ns_scoped_table(title, before[key], after[key], common_ns, fn)
-        console.print(t); issues += c
+        t, c, n = diff_ns_scoped_table(title, before[key], after[key], common_ns, fn)
+        issues += c; layer3.append((t, n))
+    print_layer("LAYER 3 — WORKLOADS", layer3)
+
+    # If nothing changed at all and we're hiding unchanged tables, say so explicitly.
+    if not show_unchanged and all(n == 0 for _, n in layer1 + layer2 + layer3):
+        console.print("[green]✓ No changes detected in any of the 22 resource categories.[/]")
 
     # Verdict
     if issues == 0:
@@ -2094,6 +2110,9 @@ def main():
     df = sub.add_parser("diff", help="Diff two snapshot JSON files (rich tables)")
     df.add_argument("--before", required=True)
     df.add_argument("--after",  required=True)
+    df.add_argument("--show-unchanged", action="store_true",
+                    help="Also show resource categories with no changes (default: only "
+                         "changed categories are printed)")
 
     ex = sub.add_parser("export",
                         help="Export clean, re-applyable YAML manifests (one file per object)")
@@ -2117,7 +2136,8 @@ def main():
         if args.command == "capture":
             snapshot_cluster(args.output_dir, args.label, include_secrets=args.include_secrets)
         elif args.command == "diff":
-            sys.exit(1 if diff_snapshots(args.before, args.after) > 0 else 0)
+            sys.exit(1 if diff_snapshots(args.before, args.after,
+                                         show_unchanged=args.show_unchanged) > 0 else 0)
         elif args.command == "export":
             export_cluster_yaml(args.output_dir,
                                 only_namespace=args.namespace,
