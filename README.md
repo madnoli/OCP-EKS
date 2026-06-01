@@ -149,6 +149,14 @@ python3 cluster_upgrade_snapshot_v5.py capture \
 
 (Use the same `--include-secrets` flag as before if you used it for the pre snapshot.)
 
+> **Want Custom Resources (operator CRs) in the diff too?** Add `--include-custom-resources`
+> to **both** the pre and post captures. It auto-discovers every CRD and fingerprints each
+> CR's declared state (status churn ignored), then the diff shows them in a dedicated
+> `[CR] CUSTOM RESOURCES` table. It's opt-in because discovery makes one API call per CRD
+> (slower on big OpenShift clusters). The built-in extras — DaemonSet, Job, ServiceAccount,
+> LimitRange, Role, ClusterRole, ClusterRoleBinding, IngressClass, PriorityClass — are always
+> captured, no flag needed.
+
 ### Step 5 — Diff and verdict
 
 ```bash
@@ -338,10 +346,15 @@ The exit code only counts critical changes.
 ## 🚫 What's intentionally NOT captured
 
 - **Secret raw values** — only hashes, even with `--include-secrets`
-- **ClusterRoleBindings** — namespace-scoped RoleBindings only (cluster-wide RBAC out of scope)
 - **MutatingWebhookConfigurations** — could add in future
-- **Specific operator CRs** — we list CRDs but not individual objects (e.g., we see `ArgoCD` CRD exists but not specific `Application` objects)
+- **Nodes / PersistentVolumes in `export`** — environment-specific, not portable
 - **System namespaces** (`kube-*`, `openshift-*`) — filtered for noise
+- **`system:*` ClusterRoles / built-in PriorityClasses** — cluster-managed, filtered as noise
+- **Jobs spawned by CronJobs** — ephemeral, filtered as noise
+
+> Note: ClusterRoles, ClusterRoleBindings, and individual operator Custom Resources
+> (e.g. `Application`, `Certificate`) **are** now captured/diffed — ClusterRole(Binding)s
+> always, CRs via `--include-custom-resources`.
 
 ---
 
@@ -383,26 +396,30 @@ metadata:
   name: cluster-snapshot-reader
 rules:
 - apiGroups: [""]
-  resources: ["namespaces", "nodes", "pods", "configmaps", "services",
-              "persistentvolumes", "persistentvolumeclaims", "resourcequotas"]
+  resources: ["namespaces", "nodes", "pods", "configmaps", "services", "endpoints",
+              "persistentvolumes", "persistentvolumeclaims", "resourcequotas",
+              "serviceaccounts", "limitranges"]
   verbs: ["list", "get"]
 - apiGroups: [""]
   resources: ["secrets"]                # only if --include-secrets
   verbs: ["list", "get"]
 - apiGroups: ["apps"]
-  resources: ["deployments", "replicasets", "statefulsets"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
   verbs: ["list", "get"]
 - apiGroups: ["batch"]
-  resources: ["cronjobs"]
+  resources: ["cronjobs", "jobs"]
   verbs: ["list", "get"]
 - apiGroups: ["rbac.authorization.k8s.io"]
-  resources: ["rolebindings"]
+  resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
   verbs: ["list", "get"]
 - apiGroups: ["storage.k8s.io"]
   resources: ["storageclasses"]
   verbs: ["list", "get"]
+- apiGroups: ["scheduling.k8s.io"]
+  resources: ["priorityclasses"]
+  verbs: ["list", "get"]
 - apiGroups: ["networking.k8s.io"]
-  resources: ["ingresses", "networkpolicies"]
+  resources: ["ingresses", "networkpolicies", "ingressclasses"]
   verbs: ["list", "get"]
 - apiGroups: ["autoscaling"]
   resources: ["horizontalpodautoscalers"]
@@ -422,6 +439,13 @@ rules:
 - apiGroups: ["config.openshift.io"]      # OpenShift only
   resources: ["clusteroperators"]
   verbs: ["list", "get"]
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  verbs: ["list", "get"]
+# For --include-custom-resources (capture) and the `export` command, you also need
+# read access to the actual CR types you want covered. The simplest grant is a broad
+# read-only role (e.g. OpenShift's built-in `cluster-reader`, or `view` per namespace).
+# Any CR type the account can't list is reported as "unavailable" and skipped, not fatal.
 ```
 
 ---
@@ -482,6 +506,7 @@ For issues, feedback, or feature requests: open an issue in this repo or ping `#
 A running log of changes made via Claude Code. Newest entries on top.
 
 ### 2026-05-29
+- **Expanded `capture`/`diff` coverage with 9 more kinds + Custom Resources** — previously `capture`/`diff` only covered 22 categories (some kinds were export-only). Added to the before/after diff: **DaemonSet, Job, ServiceAccount, LimitRange, Role** (namespaced) and **ClusterRole, ClusterRoleBinding, IngressClass, PriorityClass** (cluster-scoped) — all with NEW / MISSING / field-drift detection and noise-stripped `spec_hash` gating. Each got an extractor + comparator (e.g. DaemonSet flags `NOT FULLY SCHEDULED`, PriorityClass flags `value`/`globalDefault` changes, ServiceAccount tracks `imagePullSecrets`/`automount` but ignores auto-generated token secrets). Jobs spawned by CronJobs and `system:*`/built-in cluster objects are filtered as noise. **Custom Resources** are now also diffable via `capture --include-custom-resources` (auto-discovers CRDs, hashes each CR's declared state, skips status churn) — shown in a dedicated `[CR] CUSTOM RESOURCES` table; both pre and post captures must use the flag (same pattern as `--include-secrets`). New `diff_custom_resources_table`; `diff_snapshots` reads new keys defensively with `.get()` so it still compares older snapshots.
 - **Diff "Name" column now names the resource kind** — each diff table's Name column header reads the actual Kind (e.g. `Deployment Name`, `ConfigMap Name`, `Service Name`) instead of a generic `Name`, so it's clear what the listed names are. Driven by a `SECTION_KIND` title→kind map; unknown sections fall back to `Name`.
 - **`diff` now hides unchanged resource categories by default** — previously the report printed a "No changes" table for every one of the 22 categories, burying the actual findings. The three table builders (`diff_ns_scoped_table`, `diff_cluster_scoped_table`, `diff_pods_table`) now also return a findings count, and `diff_snapshots` only prints tables (and their layer header) when there's at least one change. If nothing changed anywhere, it prints a single `✓ No changes detected` line. Use `--show-unchanged` to restore the full all-categories output. The PASS/FAIL verdict and exit code are unaffected.
 - **Corrected stale filename/version references in README** — the Quick-start (`capture`/`diff`) examples and the CI/CD snippet still referenced the legacy `cluster_upgrade_snapshot.py`; updated all of them to the actual `cluster_upgrade_snapshot_v5.py`. Also bumped the title from `(v4)` to `(v5)` to match `__version__ = 5.0.0`.

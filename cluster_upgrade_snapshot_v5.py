@@ -540,6 +540,111 @@ def extract_clusteroperator(co):
     }
 
 
+# ── Extractors for the kinds added to capture/diff in this revision ──────────
+
+def extract_daemonset(ds):
+    """DaemonSet — spec_hash for declared config; status compared via numbers."""
+    st       = ds.status
+    desired  = st.desired_number_scheduled or 0
+    ready    = st.number_ready or 0
+    image    = (ds.spec.template.spec.containers[0].image
+                if ds.spec.template.spec.containers else "")
+    return {
+        "spec_hash":      spec_hash(ds.spec),
+        "desired":        desired,
+        "ready":          ready,
+        "ready_mismatch": desired != ready,
+        "image":          image,
+    }
+
+
+def extract_job(job):
+    """Job — spec_hash for declared config; counts are status (informational)."""
+    st = job.status
+    return {
+        "spec_hash":   spec_hash(job.spec),
+        "completions": job.spec.completions,
+        "succeeded":   st.succeeded or 0,
+        "failed":      st.failed or 0,
+        "active":      st.active or 0,
+    }
+
+
+def extract_serviceaccount(sa):
+    """ServiceAccount — track imagePullSecrets + automount, NOT the auto-generated
+    token secrets in `.secrets` (those are controller noise)."""
+    pull = sorted([s.name for s in (sa.image_pull_secrets or []) if s.name])
+    return {
+        "spec_hash":          stable_hash({"imagePullSecrets": pull,
+                                           "automount": sa.automount_service_account_token}),
+        "image_pull_secrets": pull,
+        "automount":          sa.automount_service_account_token,
+    }
+
+
+def extract_limitrange(lr):
+    return {"spec_hash": spec_hash(lr.spec)}
+
+
+def _rbac_rules(rules):
+    return sorted([
+        {"verbs":     sorted(r.verbs or []),
+         "apiGroups": sorted(r.api_groups or []),
+         "resources": sorted(r.resources or [])}
+        for r in (rules or [])
+    ], key=lambda x: (x["apiGroups"], x["resources"], x["verbs"]))
+
+
+def extract_role(role):
+    """Namespaced Role — hash the rule set (permissions)."""
+    rules = _rbac_rules(role.rules)
+    return {"spec_hash": stable_hash(rules), "rule_count": len(rules)}
+
+
+def extract_clusterrole(cr):
+    """ClusterRole — same shape as Role."""
+    rules = _rbac_rules(cr.rules)
+    return {"spec_hash": stable_hash(rules), "rule_count": len(rules)}
+
+
+def extract_clusterrolebinding(crb):
+    subjects = sorted([{"kind": s.kind, "name": s.name,
+                        "namespace": getattr(s, "namespace", None)}
+                       for s in (crb.subjects or [])],
+                      key=lambda x: (x["kind"], x["name"]))
+    role_ref = {"kind": crb.role_ref.kind, "name": crb.role_ref.name} if crb.role_ref else {}
+    return {
+        "spec_hash": stable_hash({"subjects": subjects, "role_ref": role_ref}),
+        "subjects":  subjects,
+        "role_ref":  role_ref,
+    }
+
+
+def extract_ingressclass(ic):
+    controller = ic.spec.controller if ic.spec else None
+    return {"spec_hash": spec_hash(ic.spec) if ic.spec else "empty",
+            "controller": controller}
+
+
+def extract_priorityclass(pc):
+    """PriorityClass — value / globalDefault / preemptionPolicy are TOP-LEVEL
+    fields (not under spec), so hash them explicitly."""
+    return {
+        "spec_hash":      stable_hash({"value": pc.value,
+                                       "globalDefault": bool(pc.global_default),
+                                       "preemptionPolicy": pc.preemption_policy}),
+        "value":          pc.value,
+        "global_default": bool(pc.global_default),
+    }
+
+
+def extract_custom_resource(item):
+    """Generic Custom Resource (dict from the dynamic API). declared_state_hash
+    hashes cleaned metadata + spec/data and SKIPS status, so operator-written
+    status churn doesn't show as drift."""
+    return {"spec_hash": declared_state_hash(item)}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CSV writers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -754,11 +859,13 @@ def export_all_csvs(snap, out_dir, prefix):
 # ─────────────────────────────────────────────────────────────────────────────
 # CAPTURE
 # ─────────────────────────────────────────────────────────────────────────────
-def snapshot_cluster(output_dir, label, include_secrets=False):
+def snapshot_cluster(output_dir, label, include_secrets=False,
+                     include_custom_resources=False):
     os.makedirs(output_dir, exist_ok=True)
     console.print(Panel.fit(
         f"[bold cyan]Cluster Snapshot v{__version__}[/]  •  label: [yellow]{label}[/]"
-        + ("  •  [red]including secrets (hashed)[/]" if include_secrets else ""),
+        + ("  •  [red]including secrets (hashed)[/]" if include_secrets else "")
+        + ("  •  [green]+custom resources[/]" if include_custom_resources else ""),
         border_style="cyan",
     ))
 
@@ -775,6 +882,7 @@ def snapshot_cluster(output_dir, label, include_secrets=False):
     networking_v1  = client.NetworkingV1Api()
     autoscaling_v2 = client.AutoscalingV2Api()
     policy_v1      = client.PolicyV1Api()
+    scheduling_v1  = client.SchedulingV1Api()
     apiext_v1      = client.ApiextensionsV1Api()
     apireg_v1      = client.ApiregistrationV1Api()
     custom         = client.CustomObjectsApi()
@@ -790,15 +898,20 @@ def snapshot_cluster(output_dir, label, include_secrets=False):
             "cluster_type":    cluster_type,
             "cluster_version": cluster_version,
             "include_secrets": include_secrets,
+            "include_custom_resources": include_custom_resources,
             "snapshot_tool_version": __version__,
         },
         "namespaces":   {"count": 0, "list": []},
         "deployments":  {}, "pods": {}, "statefulsets": {}, "cronjobs": {},
+        "daemonsets":   {}, "jobs": {},
         "hpas":         {}, "pdbs": {}, "resourcequotas": {},
         "configmaps":   {}, "secrets": {}, "services": {}, "routes": {},
         "ingresses":    {}, "networkpolicies": {}, "rolebindings": {}, "pvcs": {},
+        "serviceaccounts": {}, "limitranges": {}, "roles": {},
         "nodes":        {}, "pvs": {}, "storageclasses": {},
         "crds":         {}, "apiservices": {}, "clusteroperators": {},
+        "clusterroles": {}, "clusterrolebindings": {}, "ingressclasses": {},
+        "priorityclasses": {}, "customresources": {},
     }
 
     with Progress(SpinnerColumn(),
@@ -870,6 +983,15 @@ def snapshot_cluster(output_dir, label, include_secrets=False):
             sts_count += 1
         progress.update(t, description=f"[green]✓ StatefulSets ({sts_count})", completed=1)
 
+        t = progress.add_task("[cyan]DaemonSets...", total=None)
+        ds_count = 0
+        for ds in apps_v1.list_daemon_set_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items:
+            ns = ds.metadata.namespace
+            if is_system_namespace(ns): continue
+            snap["daemonsets"].setdefault(ns, {})[ds.metadata.name] = extract_daemonset(ds)
+            ds_count += 1
+        progress.update(t, description=f"[green]✓ DaemonSets ({ds_count})", completed=1)
+
         t = progress.add_task("[cyan]CronJobs...", total=None)
         cj_count = 0
         for cj in batch_v1.list_cron_job_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items:
@@ -878,6 +1000,18 @@ def snapshot_cluster(output_dir, label, include_secrets=False):
             snap["cronjobs"].setdefault(ns, {})[cj.metadata.name] = extract_cronjob(cj)
             cj_count += 1
         progress.update(t, description=f"[green]✓ CronJobs ({cj_count})", completed=1)
+
+        t = progress.add_task("[cyan]Jobs...", total=None)
+        job_count = 0
+        for job in batch_v1.list_job_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items:
+            ns = job.metadata.namespace
+            if is_system_namespace(ns): continue
+            # Skip Jobs spawned by a CronJob — they come and go constantly (pure noise).
+            if any(r.kind == "CronJob" for r in (job.metadata.owner_references or [])):
+                continue
+            snap["jobs"].setdefault(ns, {})[job.metadata.name] = extract_job(job)
+            job_count += 1
+        progress.update(t, description=f"[green]✓ Jobs ({job_count})", completed=1)
 
         t = progress.add_task("[cyan]HPAs...", total=None)
         hpa_count = 0
@@ -1011,6 +1145,33 @@ def snapshot_cluster(output_dir, label, include_secrets=False):
             pvc_count += 1
         progress.update(t, description=f"[green]✓ PVCs ({pvc_count})", completed=1)
 
+        t = progress.add_task("[cyan]ServiceAccounts...", total=None)
+        sa_count = 0
+        for sa in core_v1.list_service_account_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items:
+            ns = sa.metadata.namespace
+            if is_system_namespace(ns): continue
+            snap["serviceaccounts"].setdefault(ns, {})[sa.metadata.name] = extract_serviceaccount(sa)
+            sa_count += 1
+        progress.update(t, description=f"[green]✓ ServiceAccounts ({sa_count})", completed=1)
+
+        t = progress.add_task("[cyan]LimitRanges...", total=None)
+        lr_count = 0
+        for lr in core_v1.list_limit_range_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items:
+            ns = lr.metadata.namespace
+            if is_system_namespace(ns): continue
+            snap["limitranges"].setdefault(ns, {})[lr.metadata.name] = extract_limitrange(lr)
+            lr_count += 1
+        progress.update(t, description=f"[green]✓ LimitRanges ({lr_count})", completed=1)
+
+        t = progress.add_task("[cyan]Roles...", total=None)
+        role_count = 0
+        for role in rbac_v1.list_role_for_all_namespaces(_request_timeout=API_TIMEOUT_SECONDS).items:
+            ns = role.metadata.namespace
+            if is_system_namespace(ns): continue
+            snap["roles"].setdefault(ns, {})[role.metadata.name] = extract_role(role)
+            role_count += 1
+        progress.update(t, description=f"[green]✓ Roles ({role_count})", completed=1)
+
         # ── Layer 1: Platform (cluster-scoped) ─────────────────────────────
         t = progress.add_task("[cyan]Nodes...", total=None)
         node_count = 0
@@ -1069,6 +1230,97 @@ def snapshot_cluster(output_dir, label, include_secrets=False):
                 progress.update(t, description=f"[yellow]⚠ ClusterOps skipped: {e.reason}", completed=1)
         else:
             progress.update(t, description="[grey50]– ClusterOperators skipped (not OpenShift)", completed=1)
+
+        t = progress.add_task("[cyan]ClusterRoles...", total=None)
+        cr_count = 0
+        try:
+            for cr in rbac_v1.list_cluster_role(_request_timeout=API_TIMEOUT_SECONDS).items:
+                if _is_system_cluster_rbac(cr): continue
+                snap["clusterroles"][cr.metadata.name] = extract_clusterrole(cr)
+                cr_count += 1
+            progress.update(t, description=f"[green]✓ ClusterRoles ({cr_count})", completed=1)
+        except ApiException as e:
+            progress.update(t, description=f"[yellow]⚠ ClusterRoles skipped: {e.reason}", completed=1)
+
+        t = progress.add_task("[cyan]ClusterRoleBindings...", total=None)
+        crb_count = 0
+        try:
+            for crb in rbac_v1.list_cluster_role_binding(_request_timeout=API_TIMEOUT_SECONDS).items:
+                if _is_system_cluster_rbac(crb): continue
+                snap["clusterrolebindings"][crb.metadata.name] = extract_clusterrolebinding(crb)
+                crb_count += 1
+            progress.update(t, description=f"[green]✓ ClusterRoleBindings ({crb_count})", completed=1)
+        except ApiException as e:
+            progress.update(t, description=f"[yellow]⚠ ClusterRoleBindings skipped: {e.reason}", completed=1)
+
+        t = progress.add_task("[cyan]IngressClasses...", total=None)
+        ic_count = 0
+        try:
+            for ic in networking_v1.list_ingress_class(_request_timeout=API_TIMEOUT_SECONDS).items:
+                snap["ingressclasses"][ic.metadata.name] = extract_ingressclass(ic)
+                ic_count += 1
+            progress.update(t, description=f"[green]✓ IngressClasses ({ic_count})", completed=1)
+        except ApiException as e:
+            progress.update(t, description=f"[yellow]⚠ IngressClasses skipped: {e.reason}", completed=1)
+
+        t = progress.add_task("[cyan]PriorityClasses...", total=None)
+        pc_count = 0
+        try:
+            for pc in scheduling_v1.list_priority_class(_request_timeout=API_TIMEOUT_SECONDS).items:
+                if _is_system_priorityclass(pc): continue
+                snap["priorityclasses"][pc.metadata.name] = extract_priorityclass(pc)
+                pc_count += 1
+            progress.update(t, description=f"[green]✓ PriorityClasses ({pc_count})", completed=1)
+        except ApiException as e:
+            progress.update(t, description=f"[yellow]⚠ PriorityClasses skipped: {e.reason}", completed=1)
+
+        # ── Custom Resources (opt-in: makes one list call per CRD, much slower) ──
+        if include_custom_resources:
+            t = progress.add_task("[cyan]Custom Resources (discovering CRDs)...", total=None)
+            try:
+                discovered = apiext_v1.list_custom_resource_definition(
+                    _request_timeout=API_TIMEOUT_SECONDS).items
+            except ApiException as e:
+                discovered = []
+                progress.update(t, description=f"[yellow]⚠ CR discovery failed: {e.reason}", completed=1)
+
+            cr_objs = cr_kinds = cr_unavailable = 0
+            for crd in discovered:
+                group = crd.spec.group
+                if group == "route.openshift.io":   # captured separately as Routes
+                    continue
+                version = next((v.name for v in (crd.spec.versions or []) if v.storage), None) \
+                    or next((v.name for v in (crd.spec.versions or []) if v.served), None)
+                if not version:
+                    continue
+                kind   = crd.spec.names.kind
+                plural = crd.spec.names.plural
+                ckey   = f"{kind}.{group}"          # e.g. Certificate.cert-manager.io
+                try:
+                    resp = custom.list_cluster_custom_object(
+                        group=group, version=version, plural=plural,
+                        _request_timeout=API_TIMEOUT_SECONDS)
+                except Exception:
+                    cr_unavailable += 1
+                    continue
+                produced = False
+                for obj in (resp.get("items", []) if isinstance(resp, dict) else []):
+                    md   = obj.get("metadata") or {}
+                    ns   = md.get("namespace")
+                    name = md.get("name")
+                    if ns and is_system_namespace(ns):
+                        continue
+                    okey = f"{ns}/{name}" if ns else f"_cluster/{name}"
+                    snap["customresources"].setdefault(ckey, {})[okey] = extract_custom_resource(obj)
+                    cr_objs += 1
+                    produced = True
+                if produced:
+                    cr_kinds += 1
+            if discovered:
+                progress.update(t, description=(
+                    f"[green]✓ Custom Resources ({cr_objs} objects, {cr_kinds} kinds"
+                    + (f"; {cr_unavailable} unavailable" if cr_unavailable else "") + ")"),
+                    completed=1)
 
     # ── Persist (with secure file permissions)
     prefix = f"snapshot_{label}"
@@ -1856,6 +2108,97 @@ def cmp_clusteroperator(b, a):
     return out
 
 
+# ── Comparators for the kinds added to capture/diff in this revision ─────────
+
+def cmp_daemonset(b, a):
+    out = []
+    if b["spec_hash"] != a["spec_hash"]:
+        if b["image"] != a["image"]:
+            out.append(("image changed", False))
+        else:
+            out.append(("daemonset spec drifted", True))
+    if a["ready_mismatch"]:
+        out.append((f"NOT FULLY SCHEDULED: desired={a['desired']} ready={a['ready']}", True))
+    return out
+
+
+def cmp_job(b, a):
+    out = []
+    if b["spec_hash"] != a["spec_hash"]:
+        out.append(("job spec drifted", True))
+    if a["failed"] and a["failed"] != b.get("failed"):
+        out.append((f"job has failures: {a['failed']}", True))
+    return out
+
+
+def cmp_serviceaccount(b, a):
+    out = []
+    if b["spec_hash"] != a["spec_hash"]:
+        if b["image_pull_secrets"] != a["image_pull_secrets"]:
+            out.append((f"imagePullSecrets: {b['image_pull_secrets']} → {a['image_pull_secrets']}", True))
+        if b["automount"] != a["automount"]:
+            out.append((f"automountServiceAccountToken: {b['automount']} → {a['automount']}", True))
+        if not out:
+            out.append(("serviceaccount changed", False))
+    return out
+
+
+def cmp_limitrange(b, a):
+    if b["spec_hash"] != a["spec_hash"]:
+        return [("limits changed", True)]
+    return []
+
+
+def cmp_role(b, a):
+    if b["spec_hash"] != a["spec_hash"]:
+        return [(f"rules changed (was {b['rule_count']}, now {a['rule_count']})", True)]
+    return []
+
+
+# ClusterRole has the same shape as Role.
+cmp_clusterrole = cmp_role
+
+
+def cmp_clusterrolebinding(b, a):
+    out = []
+    if b["spec_hash"] != a["spec_hash"]:
+        if b["subjects"] != a["subjects"]:
+            out.append((f"subjects changed (was {len(b['subjects'])}, now {len(a['subjects'])})", True))
+        if b["role_ref"] != a["role_ref"]:
+            out.append((f"roleRef changed: {b['role_ref']} → {a['role_ref']}", True))
+        if not out:
+            out.append(("clusterrolebinding drifted", True))
+    return out
+
+
+def cmp_ingressclass(b, a):
+    out = []
+    if b["spec_hash"] != a["spec_hash"]:
+        if b["controller"] != a["controller"]:
+            out.append((f"controller: {b['controller']} → {a['controller']}", True))
+        else:
+            out.append(("ingressclass spec changed", True))
+    return out
+
+
+def cmp_priorityclass(b, a):
+    out = []
+    if b["spec_hash"] != a["spec_hash"]:
+        if b["value"] != a["value"]:
+            out.append((f"value: {b['value']} → {a['value']}", True))
+        if b["global_default"] != a["global_default"]:
+            out.append((f"globalDefault: {b['global_default']} → {a['global_default']}", True))
+        if not out:
+            out.append(("priorityclass changed", True))
+    return out
+
+
+def cmp_custom_resource(b, a):
+    if b["spec_hash"] != a["spec_hash"]:
+        return [("spec/config drifted", True)]
+    return []
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DIFF table builders
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1868,17 +2211,26 @@ SECTION_KIND = {
     "[L1] CRDs": "CRD",
     "[L1] API SERVICES": "APIService",
     "[L1] CLUSTER OPERATORS": "ClusterOperator",
+    "[L1] CLUSTER ROLES": "ClusterRole",
+    "[L1] CLUSTER ROLE BINDINGS": "ClusterRoleBinding",
+    "[L1] INGRESS CLASSES": "IngressClass",
+    "[L1] PRIORITY CLASSES": "PriorityClass",
     "[L2] CONFIGMAPS": "ConfigMap",
     "[L2] SERVICES": "Service",
     "[L2] INGRESSES": "Ingress",
     "[L2] NETWORK POLICIES": "NetworkPolicy",
     "[L2] ROLEBINDINGS": "RoleBinding",
+    "[L2] ROLES": "Role",
+    "[L2] SERVICE ACCOUNTS": "ServiceAccount",
+    "[L2] LIMIT RANGES": "LimitRange",
     "[L2] PVCs": "PVC",
     "[L2] ROUTES": "Route",
     "[L2] SECRETS (hashed)": "Secret",
     "[L3] DEPLOYMENTS": "Deployment",
     "[L3] STATEFULSETS": "StatefulSet",
+    "[L3] DAEMONSETS": "DaemonSet",
     "[L3] CRONJOBS": "CronJob",
+    "[L3] JOBS": "Job",
     "[L3] HPAs": "HPA",
     "[L3] PDBs": "PDB",
     "[L3] RESOURCE QUOTAS": "ResourceQuota",
@@ -1987,6 +2339,40 @@ def diff_pods_table(before, after):
     return table, critical_count, len(findings)
 
 
+def diff_custom_resources_table(before_cr, after_cr):
+    """Diff all Custom Resources. before_cr/after_cr are
+    {"<Kind>.<group>": {"<ns>/<name>": {...}}}. One combined table; each row names
+    the CR kind, the namespace/name, and the change."""
+    findings = []   # (kind, location, msg, critical)
+    for ckey in sorted(set(before_cr) | set(after_cr)):
+        kind = ckey.split(".", 1)[0]
+        b = before_cr.get(ckey, {}); a = after_cr.get(ckey, {})
+        for loc in sorted(set(b) - set(a)):
+            findings.append((kind, loc, "MISSING after upgrade", True))
+        for loc in sorted(set(a) - set(b)):
+            findings.append((kind, loc, "NEW after upgrade", False))
+        for loc in sorted(set(b) & set(a)):
+            for msg, critical in cmp_custom_resource(b[loc], a[loc]):
+                findings.append((kind, loc, msg, critical))
+
+    table = Table(title="[CR] CUSTOM RESOURCES", box=box.ROUNDED,
+                  header_style="bold magenta", title_style="bold cyan", expand=True)
+    table.add_column("", width=2)
+    table.add_column("Kind", style="cyan", no_wrap=True)
+    table.add_column("Namespace / Name", style="bold")
+    table.add_column("Change")
+    critical_count = 0
+    if not findings:
+        table.add_row("[green]✓[/]", "—", "—", "[green]No changes[/]")
+    else:
+        for kind, loc, msg, crit in findings:
+            icon  = "[red]✗[/]" if crit else "[yellow]•[/]"
+            color = "red" if crit else ("green" if msg.startswith("NEW") else "yellow")
+            table.add_row(icon, kind, loc, f"[{color}]{msg}[/]")
+            if crit: critical_count += 1
+    return table, critical_count, len(findings)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DIFF orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2043,6 +2429,14 @@ def diff_snapshots(before_file, after_file, show_unchanged=False):
                                             before["clusteroperators"], after["clusteroperators"],
                                             cmp_clusteroperator)
         issues += c; layer1.append((t, n))
+    for title, key, fn in [
+        ("[L1] CLUSTER ROLES",         "clusterroles",        cmp_clusterrole),
+        ("[L1] CLUSTER ROLE BINDINGS", "clusterrolebindings", cmp_clusterrolebinding),
+        ("[L1] INGRESS CLASSES",       "ingressclasses",      cmp_ingressclass),
+        ("[L1] PRIORITY CLASSES",      "priorityclasses",     cmp_priorityclass),
+    ]:
+        t, c, n = diff_cluster_scoped_table(title, before.get(key, {}), after.get(key, {}), fn)
+        issues += c; layer1.append((t, n))
     print_layer("LAYER 1 — PLATFORM", layer1)
 
     # LAYER 2: Configuration
@@ -2065,6 +2459,9 @@ def diff_snapshots(before_file, after_file, show_unchanged=False):
         ("[L2] INGRESSES",        "ingresses",       cmp_ingress),
         ("[L2] NETWORK POLICIES", "networkpolicies", cmp_networkpolicy),
         ("[L2] ROLEBINDINGS",     "rolebindings",    cmp_rolebinding),
+        ("[L2] ROLES",            "roles",           cmp_role),
+        ("[L2] SERVICE ACCOUNTS", "serviceaccounts", cmp_serviceaccount),
+        ("[L2] LIMIT RANGES",     "limitranges",     cmp_limitrange),
         ("[L2] PVCs",             "pvcs",            cmp_pvc),
     ]
     if before["metadata"]["cluster_type"] == "openshift":
@@ -2074,7 +2471,7 @@ def diff_snapshots(before_file, after_file, show_unchanged=False):
 
     layer2 = [(ns_table, ns_n)]
     for title, key, fn in layer2_sections:
-        t, c, n = diff_ns_scoped_table(title, before[key], after[key], common_ns, fn)
+        t, c, n = diff_ns_scoped_table(title, before.get(key, {}), after.get(key, {}), common_ns, fn)
         issues += c; layer2.append((t, n))
     print_layer("LAYER 2 — CONFIGURATION", layer2)
 
@@ -2089,18 +2486,29 @@ def diff_snapshots(before_file, after_file, show_unchanged=False):
 
     for title, key, fn in [
         ("[L3] STATEFULSETS",    "statefulsets",   cmp_statefulset),
+        ("[L3] DAEMONSETS",      "daemonsets",     cmp_daemonset),
         ("[L3] CRONJOBS",        "cronjobs",       cmp_cronjob),
+        ("[L3] JOBS",            "jobs",           cmp_job),
         ("[L3] HPAs",            "hpas",           cmp_hpa),
         ("[L3] PDBs",            "pdbs",           cmp_pdb),
         ("[L3] RESOURCE QUOTAS", "resourcequotas", cmp_resourcequota),
     ]:
-        t, c, n = diff_ns_scoped_table(title, before[key], after[key], common_ns, fn)
+        t, c, n = diff_ns_scoped_table(title, before.get(key, {}), after.get(key, {}), common_ns, fn)
         issues += c; layer3.append((t, n))
     print_layer("LAYER 3 — WORKLOADS", layer3)
 
+    # Custom Resources — only if BOTH snapshots captured them (opt-in flag).
+    cr_layer = []
+    if before["metadata"].get("include_custom_resources") and \
+       after["metadata"].get("include_custom_resources"):
+        t, c, n = diff_custom_resources_table(before.get("customresources", {}),
+                                              after.get("customresources", {}))
+        issues += c; cr_layer.append((t, n))
+        print_layer("CUSTOM RESOURCES", cr_layer)
+
     # If nothing changed at all and we're hiding unchanged tables, say so explicitly.
-    if not show_unchanged and all(n == 0 for _, n in layer1 + layer2 + layer3):
-        console.print("[green]✓ No changes detected in any of the 22 resource categories.[/]")
+    if not show_unchanged and all(n == 0 for _, n in layer1 + layer2 + layer3 + cr_layer):
+        console.print("[green]✓ No changes detected.[/]")
 
     # Verdict
     if issues == 0:
@@ -2138,6 +2546,9 @@ def main():
     cap.add_argument("--output-dir",      required=True, help="Directory for JSON + CSVs")
     cap.add_argument("--include-secrets", action="store_true",
                      help="Also capture Secrets (hashed only — no raw values stored)")
+    cap.add_argument("--include-custom-resources", action="store_true",
+                     help="Also capture Custom Resources via CRD discovery (slower; "
+                          "use the SAME flag on both pre and post captures to diff them)")
 
     df = sub.add_parser("diff", help="Diff two snapshot JSON files (rich tables)")
     df.add_argument("--before", required=True)
@@ -2166,7 +2577,9 @@ def main():
     args = p.parse_args()
     try:
         if args.command == "capture":
-            snapshot_cluster(args.output_dir, args.label, include_secrets=args.include_secrets)
+            snapshot_cluster(args.output_dir, args.label,
+                             include_secrets=args.include_secrets,
+                             include_custom_resources=args.include_custom_resources)
         elif args.command == "diff":
             sys.exit(1 if diff_snapshots(args.before, args.after,
                                          show_unchanged=args.show_unchanged) > 0 else 0)
