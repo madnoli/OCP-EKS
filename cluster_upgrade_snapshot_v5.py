@@ -1859,6 +1859,38 @@ def cmp_clusteroperator(b, a):
 # ─────────────────────────────────────────────────────────────────────────────
 # DIFF table builders
 # ─────────────────────────────────────────────────────────────────────────────
+# Maps a diff section title to the singular Kind, so the "Name" column header can
+# read e.g. "Deployment Name" instead of a generic "Name".
+SECTION_KIND = {
+    "[L1] NODES": "Node",
+    "[L1] PERSISTENT VOLUMES": "PersistentVolume",
+    "[L1] STORAGE CLASSES": "StorageClass",
+    "[L1] CRDs": "CRD",
+    "[L1] API SERVICES": "APIService",
+    "[L1] CLUSTER OPERATORS": "ClusterOperator",
+    "[L2] CONFIGMAPS": "ConfigMap",
+    "[L2] SERVICES": "Service",
+    "[L2] INGRESSES": "Ingress",
+    "[L2] NETWORK POLICIES": "NetworkPolicy",
+    "[L2] ROLEBINDINGS": "RoleBinding",
+    "[L2] PVCs": "PVC",
+    "[L2] ROUTES": "Route",
+    "[L2] SECRETS (hashed)": "Secret",
+    "[L3] DEPLOYMENTS": "Deployment",
+    "[L3] STATEFULSETS": "StatefulSet",
+    "[L3] CRONJOBS": "CronJob",
+    "[L3] HPAs": "HPA",
+    "[L3] PDBs": "PDB",
+    "[L3] RESOURCE QUOTAS": "ResourceQuota",
+}
+
+
+def _name_col(title):
+    """'Deployment Name' for a known section, else plain 'Name'."""
+    kind = SECTION_KIND.get(title)
+    return f"{kind} Name" if kind else "Name"
+
+
 def diff_ns_scoped_table(title, before_section, after_section, common_ns, compare_fn):
     findings = []
     for ns in sorted(common_ns):
@@ -1875,7 +1907,7 @@ def diff_ns_scoped_table(title, before_section, after_section, common_ns, compar
                   title_style="bold cyan", expand=True)
     table.add_column("", width=2)
     table.add_column("Namespace", style="cyan", no_wrap=True)
-    table.add_column("Name", style="bold")
+    table.add_column(_name_col(title), style="bold")
     table.add_column("Change")
     critical_count = 0
     if not findings:
@@ -1902,7 +1934,7 @@ def diff_cluster_scoped_table(title, before_section, after_section, compare_fn):
     table = Table(title=title, box=box.ROUNDED, header_style="bold magenta",
                   title_style="bold cyan", expand=True)
     table.add_column("", width=2)
-    table.add_column("Name", style="bold cyan")
+    table.add_column(_name_col(title), style="bold cyan")
     table.add_column("Change")
     critical_count = 0
     if not findings:
