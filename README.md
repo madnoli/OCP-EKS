@@ -157,26 +157,27 @@ python3 cluster_upgrade_snapshot_v5.py capture \
 > LimitRange, Role, ClusterRole, ClusterRoleBinding, IngressClass, PriorityClass — are always
 > captured, no flag needed.
 
-> **Want to verify Redis cluster health across the upgrade?** Add `--redis` to **both**
-> captures. It finds pods whose name contains `redis` (override with `--redis-name-contains`),
-> exec's `redis-cli CLUSTER INFO` + `CLUSTER NODES` inside each (no auth assumed), and records
-> `cluster_state`, slots assigned, known nodes, cluster size, master/replica counts, and
-> disconnected nodes. The diff shows a `[REDIS] CLUSTER STATUS` table flagging regressions —
-> Redis became unreachable, `cluster_state: ok → fail`, slots/size/masters dropped, or nodes
-> disconnected. Needs `pods/exec` permission. Example:
+> **Redis cluster health is checked automatically.** Whenever pods named like `redis`
+> (e.g. `redis-0`, `redis-1`) are found, `capture` exec's `redis-cli CLUSTER INFO` +
+> `CLUSTER NODES` inside each (no auth assumed) and records `cluster_state`, slots assigned,
+> known nodes, cluster size, master/replica counts, and disconnected nodes. **No flag needed**
+> on pre or post — it just runs. Each capture also prints a `Redis Cluster Status` table, and
+> the diff shows a `[REDIS] CLUSTER STATUS` table flagging regressions (Redis unreachable,
+> `cluster_state: ok → fail`, slots/size/masters dropped, nodes disconnected). Needs
+> `pods/exec` permission.
 >
 > ```bash
-> # Scope to the namespace your Redis lives in (e.g. pods redis-0, redis-1 in ns 'redis'):
-> python3 cluster_upgrade_snapshot_v5.py capture --label pre-upgrade  --output-dir ./chk \
->     --redis --redis-namespace redis
-> python3 cluster_upgrade_snapshot_v5.py capture --label post-upgrade --output-dir ./chk \
->     --redis --redis-namespace redis
+> # Nothing extra needed — Redis is auto-detected:
+> python3 cluster_upgrade_snapshot_v5.py capture --label pre-upgrade  --output-dir ./chk
+> python3 cluster_upgrade_snapshot_v5.py capture --label post-upgrade --output-dir ./chk
 > python3 cluster_upgrade_snapshot_v5.py diff \
 >     --before ./chk/snapshot_pre-upgrade.json --after ./chk/snapshot_post-upgrade.json
 > ```
 >
-> Omit `--redis-namespace` to scan every namespace. `--redis-name-contains` defaults to
-> `redis` (matches `redis-0`, `redis-1`, …); change it if your pods are named differently.
+> Controls: `--no-redis` disables it; `--redis-name-contains <str>` changes the name match
+> (default `redis`); `--redis-namespace <ns>` restricts the search to one namespace (avoids
+> matching `redis-*` exporters/sidecars elsewhere). The `export` command also writes Redis
+> status as `<ns>/RedisClusterStatus/<pod>.yaml`.
 
 ### Step 5 — Diff and verdict
 
@@ -291,6 +292,11 @@ python3 cluster_upgrade_snapshot_v5.py export --output-dir ./cluster-yaml \
 > writes **real base64 secret values** so the manifests are re-applyable. Files are
 > written with `0600` permissions — keep the output directory secure. Use `--no-secrets`
 > to skip them.
+
+**Redis status (default ON):** if pods named like `redis` are found, `export` also exec's
+`redis-cli` in each and writes the cluster status as `<ns>/RedisClusterStatus/<pod>.yaml`
+(a small status doc, not a re-applyable manifest). Controls mirror `capture`: `--no-redis`,
+`--redis-name-contains`, `--redis-namespace`. Needs `pods/exec`.
 
 Controller-generated objects are skipped automatically: SA-token / dockercfg / Helm-release
 Secrets, the `kube-root-ca.crt` / `openshift-service-ca.crt` ConfigMaps, and Jobs spawned
@@ -530,7 +536,8 @@ For issues, feedback, or feature requests: open an issue in this repo or ping `#
 A running log of changes made via Claude Code. Newest entries on top.
 
 ### 2026-05-29
-- **Redis status table now printed during every `capture --redis` run** — previously the live Redis state only appeared in the `diff`; capture just showed a one-line progress note. Now each pre and post capture prints a `Redis Cluster Status` table (per pod: reachable, cluster_state, slots, size, masters, replicas, disconnected nodes, role), so the operator sees the actual cluster health at snapshot time, before any comparison. Implemented as a reusable `render_redis_table()`.
+- **Redis check is now automatic + included in `export`** — removed the `--redis` opt-in: `capture` and `export` now run the Redis check **automatically** whenever pods named like `redis` (e.g. `redis-0`, `redis-1`) are found, so no flag is needed on pre/post captures. Disable with `--no-redis`; `--redis-name-contains`/`--redis-namespace` still tune matching. Snapshot metadata's `include_redis` is set true only when redis pods were actually found, and the diff now shows the `[REDIS]` section if **either** snapshot has it (so redis present-before/gone-after surfaces as MISSING). The `export` YAML backup now writes Redis status as `<ns>/RedisClusterStatus/<pod>.yaml`. Added a shared `collect_redis_status()` used by both commands. Note: the Redis check exec's into pods, so capture/export now require `pods/exec` whenever redis pods exist (or pass `--no-redis`).
+- **Redis status table now printed during every `capture` run (when redis pods exist)** — previously the live Redis state only appeared in the `diff`; capture just showed a one-line progress note. Now each pre and post capture prints a `Redis Cluster Status` table (per pod: reachable, cluster_state, slots, size, masters, replicas, disconnected nodes, role), so the operator sees the actual cluster health at snapshot time, before any comparison. Implemented as a reusable `render_redis_table()`.
 - **Added `--redis-namespace` to scope the Redis check** — limits the Redis pod search to a single namespace (e.g. `--redis-namespace redis` for pods `redis-0`, `redis-1` in the `redis` namespace), so name-substring matching doesn't pick up `redis-*` pods (exporters, sidecars, app clients) elsewhere. Omit it to scan all namespaces. Stored in snapshot metadata.
 - **Added Redis cluster health check across upgrades (`--redis`)** — `capture --redis` finds pods whose name contains `redis` (override via `--redis-name-contains`), exec's `redis-cli CLUSTER INFO` + `CLUSTER NODES` inside each (no auth), and records `cluster_state`, slots assigned/ok, known nodes, cluster size, master/replica counts, connected/disconnected nodes, and this pod's role. The diff renders a `[REDIS] CLUSTER STATUS` table that flags regressions as critical: Redis unreachable after upgrade, `cluster_state: ok → fail`, fewer slots assigned, smaller cluster size, lost masters, or newly disconnected nodes (a master→replica role change is shown as a non-critical failover note). Opt-in and must be set on both pre/post captures (same pattern as `--include-secrets`); needs `pods/exec` RBAC. Implemented via the kubernetes `stream` exec API with a 15s per-call timeout; pods not in `Running` phase are recorded as unreachable. Identification is by pod-name substring per the requested design.
 - **Expanded `capture`/`diff` coverage with 9 more kinds + Custom Resources** — previously `capture`/`diff` only covered 22 categories (some kinds were export-only). Added to the before/after diff: **DaemonSet, Job, ServiceAccount, LimitRange, Role** (namespaced) and **ClusterRole, ClusterRoleBinding, IngressClass, PriorityClass** (cluster-scoped) — all with NEW / MISSING / field-drift detection and noise-stripped `spec_hash` gating. Each got an extractor + comparator (e.g. DaemonSet flags `NOT FULLY SCHEDULED`, PriorityClass flags `value`/`globalDefault` changes, ServiceAccount tracks `imagePullSecrets`/`automount` but ignores auto-generated token secrets). Jobs spawned by CronJobs and `system:*`/built-in cluster objects are filtered as noise. **Custom Resources** are now also diffable via `capture --include-custom-resources` (auto-discovers CRDs, hashes each CR's declared state, skips status churn) — shown in a dedicated `[CR] CUSTOM RESOURCES` table; both pre and post captures must use the flag (same pattern as `--include-secrets`). New `diff_custom_resources_table`; `diff_snapshots` reads new keys defensively with `.get()` so it still compares older snapshots.

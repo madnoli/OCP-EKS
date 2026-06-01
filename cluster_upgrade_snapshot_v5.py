@@ -790,6 +790,32 @@ def extract_redis_status(core_v1, ns, pod, container):
     }
 
 
+def collect_redis_status(core_v1, pods, name_contains="redis",
+                         namespace=None, ns_filter=None):
+    """Find pods whose name contains `name_contains`, exec redis-cli in each, and
+    return {"<ns>/<pod>": status}. Non-Running pods are recorded as unreachable.
+    Shared by both `capture` and `export`."""
+    sub = (name_contains or "redis").lower()
+    result = {}
+    for p in pods:
+        name = p.metadata.name or ""
+        if sub not in name.lower():
+            continue
+        ns = p.metadata.namespace
+        if namespace is not None and ns != namespace:
+            continue
+        if ns_filter is not None and not ns_filter(ns):
+            continue
+        key = f"{ns}/{name}"
+        if p.status.phase != "Running":
+            result[key] = {"reachable": False,
+                           "error": f"pod phase {p.status.phase}", "container": None}
+            continue
+        container = _pick_redis_container(p)
+        result[key] = extract_redis_status(core_v1, ns, name, container)
+    return result
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CSV writers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1006,16 +1032,14 @@ def export_all_csvs(snap, out_dir, prefix):
 # ─────────────────────────────────────────────────────────────────────────────
 def snapshot_cluster(output_dir, label, include_secrets=False,
                      include_custom_resources=False,
-                     include_redis=False, redis_name_contains="redis",
+                     redis_check=True, redis_name_contains="redis",
                      redis_namespace=None):
     os.makedirs(output_dir, exist_ok=True)
     console.print(Panel.fit(
         f"[bold cyan]Cluster Snapshot v{__version__}[/]  •  label: [yellow]{label}[/]"
         + ("  •  [red]including secrets (hashed)[/]" if include_secrets else "")
         + ("  •  [green]+custom resources[/]" if include_custom_resources else "")
-        + (f"  •  [green]+redis (name~'{redis_name_contains}'"
-           + (f" in ns '{redis_namespace}'" if redis_namespace else "") + ")[/]"
-           if include_redis else ""),
+        + ("  •  [grey50]redis: auto-detect[/]" if redis_check else "  •  [grey50]redis: off[/]"),
         border_style="cyan",
     ))
 
@@ -1049,7 +1073,7 @@ def snapshot_cluster(output_dir, label, include_secrets=False,
             "cluster_version": cluster_version,
             "include_secrets": include_secrets,
             "include_custom_resources": include_custom_resources,
-            "include_redis": include_redis,
+            "include_redis": False,   # set True below if redis pods are found
             "redis_name_contains": redis_name_contains,
             "redis_namespace": redis_namespace,
             "snapshot_tool_version": __version__,
@@ -1127,31 +1151,27 @@ def snapshot_cluster(output_dir, label, include_secrets=False,
             })
         progress.update(t, description=f"[green]✓ Pods ({len(pods)})", completed=1)
 
-        # Redis cluster status — exec redis-cli into pods whose NAME contains the
-        # substring. Opt-in (slow: one+ exec per matching pod) and needs pods/exec.
-        if include_redis:
+        # Redis cluster status — runs AUTOMATICALLY when pods whose name contains
+        # `redis_name_contains` are found (no flag needed). Exec's redis-cli per pod
+        # (needs pods/exec). Disable with --no-redis.
+        redis_ran = False
+        if redis_check:
             sub = (redis_name_contains or "redis").lower()
-            scope = f" in ns '{redis_namespace}'" if redis_namespace else ""
-            t = progress.add_task(f"[cyan]Redis status (exec, name~'{sub}'{scope})...", total=None)
-            redis_pods = [p for p in pods
-                          if sub in (p.metadata.name or "").lower()
-                          and (redis_namespace is None
-                               or p.metadata.namespace == redis_namespace)]
-            for p in redis_pods:
-                ns, name = p.metadata.namespace, p.metadata.name
-                key = f"{ns}/{name}"
-                if p.status.phase != "Running":
-                    snap["redis"][key] = {"reachable": False,
-                                          "error": f"pod phase {p.status.phase}",
-                                          "container": None}
-                    continue
-                container = _pick_redis_container(p)
-                snap["redis"][key] = extract_redis_status(core_v1, ns, name, container)
-            ok = sum(1 for v in snap["redis"].values() if v.get("reachable"))
-            progress.update(t, description=(
-                f"[green]✓ Redis status ({ok}/{len(redis_pods)} reachable)"
-                if redis_pods else
-                f"[yellow]⚠ Redis: no pods match name~'{sub}'"), completed=1)
+            matched = [p for p in pods
+                       if sub in (p.metadata.name or "").lower()
+                       and (redis_namespace is None
+                            or p.metadata.namespace == redis_namespace)]
+            if matched:
+                redis_ran = True
+                scope = f" in ns '{redis_namespace}'" if redis_namespace else ""
+                t = progress.add_task(
+                    f"[cyan]Redis status (auto, {len(matched)} pod(s){scope})...", total=None)
+                snap["redis"] = collect_redis_status(core_v1, matched, redis_name_contains)
+                ok = sum(1 for v in snap["redis"].values() if v.get("reachable"))
+                progress.update(t,
+                    description=f"[green]✓ Redis status ({ok}/{len(snap['redis'])} reachable)",
+                    completed=1)
+        snap["metadata"]["include_redis"] = redis_ran
 
         t = progress.add_task("[cyan]StatefulSets...", total=None)
         sts_count = 0
@@ -1544,9 +1564,9 @@ def snapshot_cluster(output_dir, label, include_secrets=False,
         table.add_row("1 Platform", "ClusterOps", str(co_count))
     console.print(); console.print(table)
 
-    # Always show the Redis status table when --redis was used, for BOTH pre and
-    # post captures — so the operator sees the live cluster state at capture time.
-    if include_redis:
+    # Always show the Redis status table when redis pods were found, for BOTH pre
+    # and post captures — so the operator sees the live cluster state at capture time.
+    if redis_ran:
         console.print()
         console.print(render_redis_table(snap["redis"],
                                          title=f"Redis Cluster Status  •  {label}"))
@@ -1732,7 +1752,9 @@ def _is_system_priorityclass(o):
 
 def export_cluster_yaml(output_dir, only_namespace=None,
                         exclude_system=False, include_secrets=True,
-                        include_cluster_scoped=True, include_custom_resources=True):
+                        include_cluster_scoped=True, include_custom_resources=True,
+                        redis_check=True, redis_name_contains="redis",
+                        redis_namespace=None):
     os.makedirs(output_dir, exist_ok=True)
     # Cluster-scoped objects are global, not tied to one namespace — skip them when
     # the export is targeted at a single namespace.
@@ -1992,6 +2014,34 @@ def export_cluster_yaml(output_dir, only_namespace=None,
                     n += 1
                 progress.update(t, description=f"[green]✓ {kind} ({n}) [grey50]→ {CLUSTER_SCOPED_DIR}/[/]",
                                 completed=1)
+
+        # ── Redis cluster status (auto-detect; written as YAML alongside manifests) ──
+        if redis_check:
+            sub = (redis_name_contains or "redis").lower()
+            t = progress.add_task("[cyan]Redis status (auto)...", total=None)
+            try:
+                all_pods = core_v1.list_pod_for_all_namespaces(
+                    _request_timeout=API_TIMEOUT_SECONDS).items
+            except ApiException as e:
+                all_pods = []
+                progress.update(t, description=f"[yellow]⚠ Redis skipped: {e.reason}", completed=1)
+            redis_data = collect_redis_status(core_v1, all_pods, redis_name_contains,
+                                              namespace=redis_namespace, ns_filter=want_ns)
+            for rkey, status in redis_data.items():
+                ns, pod = rkey.split("/", 1)
+                doc = {
+                    "apiVersion": "snapshot.local/v1",
+                    "kind":       "RedisClusterStatus",
+                    "metadata":   {"namespace": ns, "name": pod},
+                    "status":     status,
+                }
+                emit(ns, "RedisClusterStatus", pod, doc)
+                namespaces_seen.add(ns)
+            if all_pods:
+                ok = sum(1 for v in redis_data.values() if v.get("reachable"))
+                progress.update(t, description=(
+                    f"[green]✓ Redis status ({ok}/{len(redis_data)} reachable)"
+                    if redis_data else "[grey50]– Redis: no matching pods"), completed=1)
 
     total_files = stats["total"]
     table = Table(title="YAML Export Summary", box=box.ROUNDED, header_style="bold magenta")
@@ -2729,9 +2779,10 @@ def diff_snapshots(before_file, after_file, show_unchanged=False):
         issues += c; cr_layer.append((t, n))
         print_layer("CUSTOM RESOURCES", cr_layer)
 
-    # Redis cluster status — only if BOTH snapshots captured it (--redis).
+    # Redis cluster status — shown if EITHER snapshot has it (so redis present
+    # before but gone after still surfaces as MISSING).
     redis_layer = []
-    if before["metadata"].get("include_redis") and after["metadata"].get("include_redis"):
+    if before["metadata"].get("include_redis") or after["metadata"].get("include_redis"):
         t, c, n = diff_cluster_scoped_table("[REDIS] CLUSTER STATUS",
                                             before.get("redis", {}), after.get("redis", {}),
                                             cmp_redis)
@@ -2782,10 +2833,10 @@ def main():
     cap.add_argument("--include-custom-resources", action="store_true",
                      help="Also capture Custom Resources via CRD discovery (slower; "
                           "use the SAME flag on both pre and post captures to diff them)")
-    cap.add_argument("--redis", action="store_true",
-                     help="Also capture Redis cluster status by exec'ing redis-cli in pods "
-                          "whose NAME matches --redis-name-contains (needs pods/exec; use the "
-                          "SAME flag on both pre and post captures)")
+    cap.add_argument("--no-redis", action="store_true",
+                     help="Skip the Redis cluster check. By DEFAULT it runs automatically "
+                          "whenever pods named like 'redis' are found (needs pods/exec) — no "
+                          "flag needed on pre/post captures.")
     cap.add_argument("--redis-name-contains", default="redis",
                      help="Substring to match Redis pod names (default: 'redis')")
     cap.add_argument("--redis-namespace",
@@ -2815,6 +2866,13 @@ def main():
                     help="Do NOT export cluster-scoped objects like ClusterRoles, StorageClasses, "
                          "CRDs (default: they ARE exported, into _cluster-scoped/). Ignored when "
                          "--namespace is set.")
+    ex.add_argument("--no-redis", action="store_true",
+                    help="Do NOT export Redis cluster status (default: auto-detected and written "
+                         "as <ns>/RedisClusterStatus/<pod>.yaml when redis pods are found)")
+    ex.add_argument("--redis-name-contains", default="redis",
+                    help="Substring to match Redis pod names (default: 'redis')")
+    ex.add_argument("--redis-namespace",
+                    help="Limit the Redis check to this namespace (default: all namespaces)")
 
     args = p.parse_args()
     try:
@@ -2822,7 +2880,7 @@ def main():
             snapshot_cluster(args.output_dir, args.label,
                              include_secrets=args.include_secrets,
                              include_custom_resources=args.include_custom_resources,
-                             include_redis=args.redis,
+                             redis_check=not args.no_redis,
                              redis_name_contains=args.redis_name_contains,
                              redis_namespace=args.redis_namespace)
         elif args.command == "diff":
@@ -2834,7 +2892,10 @@ def main():
                                 exclude_system=args.exclude_system,
                                 include_secrets=not args.no_secrets,
                                 include_cluster_scoped=not args.no_cluster_scoped,
-                                include_custom_resources=not args.no_custom_resources)
+                                include_custom_resources=not args.no_custom_resources,
+                                redis_check=not args.no_redis,
+                                redis_name_contains=args.redis_name_contains,
+                                redis_namespace=args.redis_namespace)
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠ Interrupted by user. Partial output may exist.[/]")
         sys.exit(130)
