@@ -715,6 +715,47 @@ def _parse_cluster_nodes(text):
     return masters, replicas, connected, disconnected, myself_role
 
 
+def render_redis_table(redis_data, title="Redis Cluster Status"):
+    """Build a rich table of per-pod Redis status. Used at capture time so the
+    state is visible in BOTH the pre and post runs (not just the diff)."""
+    table = Table(title=title, box=box.ROUNDED, header_style="bold magenta",
+                  title_style="bold cyan", expand=True)
+    table.add_column("Pod (ns/name)", style="cyan", no_wrap=True)
+    table.add_column("Reachable")
+    table.add_column("Cluster State")
+    table.add_column("Slots", justify="right")
+    table.add_column("Size", justify="right")
+    table.add_column("Masters", justify="right")
+    table.add_column("Replicas", justify="right")
+    table.add_column("Disconn.", justify="right")
+    table.add_column("Role")
+
+    if not redis_data:
+        table.add_row("—", "[yellow]no matching pods[/]", "—", "—", "—", "—", "—", "—", "—")
+        return table
+
+    for key in sorted(redis_data):
+        r = redis_data[key]
+        if not r.get("reachable"):
+            table.add_row(key, f"[red]NO[/] [grey50]({r.get('error') or '?'})[/]",
+                          "—", "—", "—", "—", "—", "—", "—")
+            continue
+        state    = r.get("cluster_state") or "—"
+        state_c  = "green" if state == "ok" else "red"
+        disc     = r.get("nodes_disconnected", 0)
+        disc_str = f"[red]{disc}[/]" if disc else "0"
+        table.add_row(
+            key, "[green]YES[/]", f"[{state_c}]{state}[/]",
+            str(r.get("cluster_slots_assigned", "—")),
+            str(r.get("cluster_size", "—")),
+            str(r.get("masters", "—")),
+            str(r.get("replicas", "—")),
+            disc_str,
+            r.get("myself_role") or "—",
+        )
+    return table
+
+
 def extract_redis_status(core_v1, ns, pod, container):
     """Exec redis-cli CLUSTER INFO + CLUSTER NODES; return a comparable status dict."""
     info_txt, err = _redis_exec(core_v1, ns, pod, container, ["cluster", "info"])
@@ -1502,6 +1543,13 @@ def snapshot_cluster(output_dir, label, include_secrets=False,
     if cluster_type == "openshift":
         table.add_row("1 Platform", "ClusterOps", str(co_count))
     console.print(); console.print(table)
+
+    # Always show the Redis status table when --redis was used, for BOTH pre and
+    # post captures — so the operator sees the live cluster state at capture time.
+    if include_redis:
+        console.print()
+        console.print(render_redis_table(snap["redis"],
+                                         title=f"Redis Cluster Status  •  {label}"))
 
     console.print(f"\n[green]✓ Files written to:[/] [bold]{output_dir}/[/]  [grey50](mode 0600)[/]")
 
