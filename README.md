@@ -1,4 +1,4 @@
-# 🚀 cluster-upgrade-snapshot  (v4)
+# 🚀 cluster-upgrade-snapshot  (v5)
 
 > A safety-net tool that takes a **complete fingerprint** of your Kubernetes / OpenShift
 > cluster **before** an upgrade and **after** an upgrade, then highlights every meaningful
@@ -93,7 +93,7 @@ oc login --token=<sha256~...> --server=https://api.my-ocp.example.com:6443
 ### Step 2 — BEFORE snapshot (right before upgrade)
 
 ```bash
-python3 cluster_upgrade_snapshot.py capture \
+python3 cluster_upgrade_snapshot_v5.py capture \
     --label pre-upgrade \
     --output-dir /tmp/upgrade-2026-05-27
 ```
@@ -101,7 +101,7 @@ python3 cluster_upgrade_snapshot.py capture \
 Add `--include-secrets` if your security policy allows hash-based secret tracking:
 
 ```bash
-python3 cluster_upgrade_snapshot.py capture \
+python3 cluster_upgrade_snapshot_v5.py capture \
     --label pre-upgrade \
     --output-dir /tmp/upgrade-2026-05-27 \
     --include-secrets
@@ -142,7 +142,7 @@ This creates:
 ### Step 4 — AFTER snapshot
 
 ```bash
-python3 cluster_upgrade_snapshot.py capture \
+python3 cluster_upgrade_snapshot_v5.py capture \
     --label post-upgrade \
     --output-dir /tmp/upgrade-2026-05-27
 ```
@@ -152,7 +152,7 @@ python3 cluster_upgrade_snapshot.py capture \
 ### Step 5 — Diff and verdict
 
 ```bash
-python3 cluster_upgrade_snapshot.py diff \
+python3 cluster_upgrade_snapshot_v5.py diff \
     --before /tmp/upgrade-2026-05-27/snapshot_pre-upgrade.json \
     --after  /tmp/upgrade-2026-05-27/snapshot_post-upgrade.json
 ```
@@ -291,7 +291,7 @@ The `diff` command returns:
 Wire it into CloudBees CD / Jenkins / Ansible AAP:
 
 ```bash
-if ! python3 cluster_upgrade_snapshot.py diff --before pre.json --after post.json; then
+if ! python3 cluster_upgrade_snapshot_v5.py diff --before pre.json --after post.json; then
     echo "Upgrade verification FAILED — initiating rollback"
     ansible-playbook rollback.yml
     exit 1
@@ -482,6 +482,7 @@ For issues, feedback, or feature requests: open an issue in this repo or ping `#
 A running log of changes made via Claude Code. Newest entries on top.
 
 ### 2026-05-29
+- **Corrected stale filename/version references in README** — the Quick-start (`capture`/`diff`) examples and the CI/CD snippet still referenced the legacy `cluster_upgrade_snapshot.py`; updated all of them to the actual `cluster_upgrade_snapshot_v5.py`. Also bumped the title from `(v4)` to `(v5)` to match `__version__ = 5.0.0`.
 - **Export now covers Custom Resources + cluster-scoped objects (near-full backup)** — the `export` command was extended beyond the 18 curated namespaced kinds. It now (a) auto-discovers every Custom Resource by listing the cluster's CRDs and dumping each CR's storage version across all namespaces (operator-managed objects: cert-manager, ArgoCD, Prometheus, vendor CRs, etc.), and (b) exports cluster-scoped objects — Namespace, ClusterRole, ClusterRoleBinding, StorageClass, PriorityClass, IngressClass, CustomResourceDefinition, and cluster-scoped CRs — into a top-level `_cluster-scoped/` folder. Both are ON by default; opt out with `--no-custom-resources` / `--no-cluster-scoped` (the latter is auto-skipped when `--namespace` targets a single namespace). Cluster-managed defaults (`system:*` ClusterRoles, built-in PriorityClasses) are filtered out; Nodes/PVs are intentionally excluded as environment-specific. CRD kinds that can't be listed (aggregated API down, RBAC, conversion webhook) are counted as "unavailable" and skipped rather than aborting. Needs broader read RBAC than the curated export.
 - **Suppressed repeated `InsecureRequestWarning` spam** — when the kubeconfig sets `insecure-skip-tls-verify` (common on internal OCP clusters with self-signed certs), urllib3 printed a multi-line warning on *every* API call, flooding the output. `load_kube_config()` now disables that one warning — but only when TLS verification is actually off — and prints a single grey notice instead, so the security trade-off stays visible. Verification-enabled clusters are unaffected.
 - **Fixed Python 3.6 compatibility (`TypeError: __init__() got an unexpected keyword argument 'required'`)** — `argparse.add_subparsers()` only accepts `required=` on Python 3.7+, but RHEL/OCP nodes commonly ship Python 3.6.8. Now sets `sub.required = True` via the attribute instead of the constructor kwarg, so the script runs on 3.6 as well. (The `required=True` args on individual `add_argument()` calls are fine on all versions.)
