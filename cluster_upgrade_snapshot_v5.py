@@ -1926,7 +1926,10 @@ def main():
     p.add_argument("--version", action="version",
                    version=f"cluster_upgrade_snapshot {__version__}")
 
-    sub = p.add_subparsers(dest="command", required=True)
+    # NOTE: required=True on add_subparsers() needs Python 3.7+. We set it via the
+    # attribute instead so the script also runs on Python 3.6 (common on RHEL/OCP nodes).
+    sub = p.add_subparsers(dest="command")
+    sub.required = True
 
     cap = sub.add_parser("capture", help="Capture a cluster snapshot (JSON + CSVs)")
     cap.add_argument("--label",           required=True, help="e.g. 'pre-upgrade'")
