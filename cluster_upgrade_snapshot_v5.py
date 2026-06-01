@@ -723,24 +723,75 @@ def extract_redb_status(item):
 
 
 def _parse_rladmin_status(text):
-    """Minimal parse of `rladmin status` text: count nodes/dbs/shards and detect
-    any 'down'/'not in sync'/'trimmed' problems. Returns a summary dict."""
+    """Section-aware parse of `rladmin status`. Counts nodes/dbs/shards, detects
+    problems, AND builds per-database detail (shard placement by node + role,
+    endpoint count) from the SHARDS and ENDPOINTS sections."""
+    BAD = ("down", "not in sync", "trimmed", "missing", "failed")
+    section = None
     nodes = dbs = shards = 0
     issues = []
+    per_db = {}   # key: "<db:id> <name>" → accumulating dict
+
+    def _db_entry(parts):
+        db_id = parts[0]
+        name  = parts[1] if len(parts) > 1 else ""
+        key   = f"{db_id} {name}".strip()
+        return key, per_db.setdefault(key, {
+            "shards": [], "master_shards": 0, "replica_shards": 0,
+            "nodes": set(), "endpoints": 0})
+
     for raw in (text or "").splitlines():
-        line  = raw.strip()
-        lower = line.lower()
-        token = line.lstrip("*").strip()
-        if token.startswith("node:"):
+        s = raw.strip()
+        if not s:
+            continue
+        up = s.upper()
+        if up.startswith("CLUSTER NODES"): section = "nodes";     continue
+        if up.startswith("DATABASES"):     section = "dbs";       continue
+        if up.startswith("ENDPOINTS"):     section = "endpoints"; continue
+        if up.startswith("SHARDS"):        section = "shards";    continue
+
+        if any(b in s.lower() for b in BAD):
+            issues.append(s[:160])
+
+        token = s.lstrip("*").strip()
+        parts = token.split()
+
+        if section == "nodes" and token.startswith("node:"):
             nodes += 1
-        elif token.startswith("db:"):
+        elif section == "dbs" and token.startswith("db:"):
             dbs += 1
-        elif token.startswith("redis:") or token.startswith("shard:"):
+        elif section == "shards" and token.startswith("db:"):
             shards += 1
-        if any(bad in lower for bad in ("down", "not in sync", "trimmed", "missing", "failed")):
-            issues.append(line[:160])
+            _key, d = _db_entry(parts)
+            shard_id = next((p for p in parts if p.startswith(("redis:", "shard:"))), None)
+            node_id  = next((p for p in parts if p.startswith("node:")), None)
+            role     = next((p for p in parts if p.lower() in ("master", "slave", "replica")), None)
+            status   = parts[-1] if parts else None
+            d["shards"].append({"shard": shard_id, "node": node_id,
+                                "role": role, "status": status})
+            if role == "master":
+                d["master_shards"] += 1
+            elif role in ("slave", "replica"):
+                d["replica_shards"] += 1
+            if node_id:
+                d["nodes"].add(node_id)
+        elif section == "endpoints" and token.startswith("db:"):
+            _key, d = _db_entry(parts)
+            d["endpoints"] += 1
+
+    per_db_out = {}
+    for k, v in per_db.items():
+        per_db_out[k] = {
+            "shards_total":  len(v["shards"]),
+            "master_shards": v["master_shards"],
+            "replica_shards": v["replica_shards"],
+            "nodes":         sorted(v["nodes"]),
+            "endpoints":     v["endpoints"],
+            "shard_detail":  v["shards"],
+        }
     return {"nodes": nodes, "databases": dbs, "shards": shards,
-            "issues": issues[:20], "issue_count": len(issues)}
+            "issues": issues[:20], "issue_count": len(issues),
+            "per_db": per_db_out}
 
 
 def _is_rec_data_node(name):
@@ -800,7 +851,7 @@ def collect_redis_enterprise(core_v1, custom, apiext_v1, pods,
             continue
         parsed = _parse_rladmin_status(out)
         parsed.update({"reachable": True, "error": None,
-                       "raw_excerpt": out[:4000]})
+                       "raw_excerpt": out[:8000]})
         data["rladmin"][key] = parsed
         break   # one successful node is enough
     return data
@@ -864,6 +915,25 @@ def render_redis_tables(redis_data, label=""):
     else:
         rt.add_row("—", "[yellow]no data node reached[/]", "—", "—", "—", "—")
     tables.append(rt)
+
+    # Per-database shard placement (from the reached data node's rladmin per_db)
+    per_db = {}
+    for r in (redis_data.get("rladmin") or {}).values():
+        if r.get("reachable") and r.get("per_db"):
+            per_db = r["per_db"]
+            break
+    if per_db:
+        st = Table(title=f"Redis Enterprise — Shard placement (rladmin){suffix}",
+                   box=box.ROUNDED, header_style="bold magenta",
+                   title_style="bold cyan", expand=True)
+        for col in ("Database", "Shards", "Masters", "Replicas", "Endpoints", "Nodes"):
+            st.add_column(col, style="cyan" if col == "Database" else None)
+        for db in sorted(per_db):
+            d = per_db[db]
+            st.add_row(db, str(d.get("shards_total", "—")),
+                       str(d.get("master_shards", "—")), str(d.get("replica_shards", "—")),
+                       str(d.get("endpoints", "—")), ", ".join(d.get("nodes") or []) or "—")
+        tables.append(st)
     return tables
 
 
@@ -2544,6 +2614,28 @@ def cmp_rladmin(b, a):
     if a.get("issue_count", 0) > b.get("issue_count", 0):
         out.append((f"rladmin issues: {b.get('issue_count', 0)} → {a.get('issue_count', 0)} "
                     f"(e.g. {(a.get('issues') or ['?'])[0]})", True))
+
+    # Per-database shard placement / redundancy.
+    b_db = b.get("per_db") or {}
+    a_db = a.get("per_db") or {}
+    for db in sorted(set(b_db) | set(a_db)):
+        bd, ad = b_db.get(db), a_db.get(db)
+        if bd and not ad:
+            out.append((f"DB '{db}': gone from rladmin", True)); continue
+        if ad and not bd:
+            out.append((f"DB '{db}': new in rladmin", False)); continue
+        if bd.get("master_shards") != ad.get("master_shards"):
+            out.append((f"DB '{db}' master shards: {bd.get('master_shards')} → "
+                        f"{ad.get('master_shards')}", True))
+        if bd.get("replica_shards") != ad.get("replica_shards"):
+            out.append((f"DB '{db}' replica shards: {bd.get('replica_shards')} → "
+                        f"{ad.get('replica_shards')}", True))
+        if bd.get("endpoints") != ad.get("endpoints"):
+            out.append((f"DB '{db}' endpoints: {bd.get('endpoints')} → {ad.get('endpoints')}", True))
+        if bd.get("nodes") != ad.get("nodes"):
+            # shard relocation is expected during a rolling upgrade → non-critical
+            out.append((f"DB '{db}' shard nodes: {bd.get('nodes')} → {ad.get('nodes')} "
+                        f"(relocation)", False))
     return out
 
 
