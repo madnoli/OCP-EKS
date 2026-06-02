@@ -67,7 +67,7 @@ This tool gives you a **complete before/after diff in 30 seconds**, organized by
 
 ```bash
 pip3 install -r requirements.txt
-chmod +x cluster_upgrade_snapshot_v5.py
+chmod +x cluster_upgrade_snapshot.py
 ```
 
 **Requirements:**
@@ -93,7 +93,7 @@ oc login --token=<sha256~...> --server=https://api.my-ocp.example.com:6443
 ### Step 2 — BEFORE snapshot (right before upgrade)
 
 ```bash
-python3 cluster_upgrade_snapshot_v5.py capture \
+python3 cluster_upgrade_snapshot.py capture \
     --label pre-upgrade \
     --output-dir /tmp/upgrade-2026-05-27
 ```
@@ -101,7 +101,7 @@ python3 cluster_upgrade_snapshot_v5.py capture \
 Add `--include-secrets` if your security policy allows hash-based secret tracking:
 
 ```bash
-python3 cluster_upgrade_snapshot_v5.py capture \
+python3 cluster_upgrade_snapshot.py capture \
     --label pre-upgrade \
     --output-dir /tmp/upgrade-2026-05-27 \
     --include-secrets
@@ -142,7 +142,7 @@ This creates:
 ### Step 4 — AFTER snapshot
 
 ```bash
-python3 cluster_upgrade_snapshot_v5.py capture \
+python3 cluster_upgrade_snapshot.py capture \
     --label post-upgrade \
     --output-dir /tmp/upgrade-2026-05-27
 ```
@@ -170,9 +170,9 @@ python3 cluster_upgrade_snapshot_v5.py capture \
 >
 > ```bash
 > # Nothing extra needed — Redis Enterprise is auto-detected (defaults: ns 'redis', pods 'rec-*'):
-> python3 cluster_upgrade_snapshot_v5.py capture --label pre-upgrade  --output-dir ./chk
-> python3 cluster_upgrade_snapshot_v5.py capture --label post-upgrade --output-dir ./chk
-> python3 cluster_upgrade_snapshot_v5.py diff \
+> python3 cluster_upgrade_snapshot.py capture --label pre-upgrade  --output-dir ./chk
+> python3 cluster_upgrade_snapshot.py capture --label post-upgrade --output-dir ./chk
+> python3 cluster_upgrade_snapshot.py diff \
 >     --before ./chk/snapshot_pre-upgrade.json --after ./chk/snapshot_post-upgrade.json
 > ```
 >
@@ -184,7 +184,7 @@ python3 cluster_upgrade_snapshot_v5.py capture \
 ### Step 5 — Diff and verdict
 
 ```bash
-python3 cluster_upgrade_snapshot_v5.py diff \
+python3 cluster_upgrade_snapshot.py diff \
     --before /tmp/upgrade-2026-05-27/snapshot_pre-upgrade.json \
     --after  /tmp/upgrade-2026-05-27/snapshot_post-upgrade.json
 ```
@@ -246,16 +246,16 @@ suitable for backup, GitOps seeding, or moving objects between clusters:
 
 ```bash
 # Every namespace (including kube-* / openshift-*), all supported kinds:
-python3 cluster_upgrade_snapshot_v5.py export --output-dir ./cluster-yaml
+python3 cluster_upgrade_snapshot.py export --output-dir ./cluster-yaml
 
 # A single namespace:
-python3 cluster_upgrade_snapshot_v5.py export --output-dir ./my-app-yaml --namespace my-app
+python3 cluster_upgrade_snapshot.py export --output-dir ./my-app-yaml --namespace my-app
 
 # Skip system namespaces:
-python3 cluster_upgrade_snapshot_v5.py export --output-dir ./cluster-yaml --exclude-system
+python3 cluster_upgrade_snapshot.py export --output-dir ./cluster-yaml --exclude-system
 
 # Skip Secrets (by default Secrets ARE exported, with real base64 values):
-python3 cluster_upgrade_snapshot_v5.py export --output-dir ./cluster-yaml --no-secrets
+python3 cluster_upgrade_snapshot.py export --output-dir ./cluster-yaml --no-secrets
 ```
 
 **Exported namespaced kinds:** ConfigMap, Secret*, Service, Endpoints, PersistentVolumeClaim,
@@ -278,10 +278,10 @@ environment-specific and not portable.
 
 ```bash
 # Full backup: all namespaces, all CRs, plus cluster-scoped objects (the defaults):
-python3 cluster_upgrade_snapshot_v5.py export --output-dir ./cluster-yaml
+python3 cluster_upgrade_snapshot.py export --output-dir ./cluster-yaml
 
 # Just the built-in namespaced kinds (skip CRs + cluster-scoped):
-python3 cluster_upgrade_snapshot_v5.py export --output-dir ./cluster-yaml \
+python3 cluster_upgrade_snapshot.py export --output-dir ./cluster-yaml \
     --no-custom-resources --no-cluster-scoped
 ```
 
@@ -330,7 +330,7 @@ The `diff` command returns:
 Wire it into CloudBees CD / Jenkins / Ansible AAP:
 
 ```bash
-if ! python3 cluster_upgrade_snapshot_v5.py diff --before pre.json --after post.json; then
+if ! python3 cluster_upgrade_snapshot.py diff --before pre.json --after post.json; then
     echo "Upgrade verification FAILED — initiating rollback"
     ansible-playbook rollback.yml
     exit 1
@@ -540,6 +540,7 @@ For issues, feedback, or feature requests: open an issue in this repo or ping `#
 A running log of changes made via Claude Code. Newest entries on top.
 
 ### 2026-05-29
+- **Renamed the script `cluster_upgrade_snapshot_v5.py` → `cluster_upgrade_snapshot.py`** for the GitLab repo — dropped the `_v5` suffix (version is tracked in `__version__`, currently `5.0.0`, not the filename); the new name matches the repo title and the script's own internal docstring. Done via `git mv` to preserve history. Updated all live command examples and the installation step in this README accordingly.
 - **Dropped the REDB custom-resource path (deduplicated DB health)** — since rladmin's DATABASES section provides richer, ground-truth per-database status, removed the now-redundant `RedisEnterpriseDatabase` CR collection, its "Databases (REDB)" capture table, and its `[REDIS] DATABASES (REDB)` diff section. The single rladmin-sourced "Databases" table/diff remains. Deleted dead code (`extract_redb_status`, `cmp_redb`, `REDB_PLURAL`, `REDB_HEALTHY_STATUS`); db counts now derive from rladmin `per_db`; export writes only `RedisEnterpriseClusterStatus` + `RladminStatus`. (Note: the REC cluster CR is still read for cluster state/desired-nodes.)
 - **rladmin parser rebuilt for the real `extra all` format (multi-word headers)** — the actual `rladmin status extra all` output uses space-separated column headers (`USED MEMORY`, `RAM FRAG`, `WATCHDOG STATUS`) and a rich `CLUSTER`/`DATABASES` block, which the header-zip parser couldn't read. Rewrote `_parse_rladmin_status` to anchor on the stable tokens (`db:`, `node:`, `redis:`, `endpoint:`) and fixed trailing columns instead of the header. Now captures: cluster health + master, per-node role/hostname/version/status (+ problem-node list), per-database status/declared-shards/replication/persistence/version/endpoint (from the DATABASES section), and per-shard node/role/slots/used-memory/ram-frag/watchdog/status (+ problem-shard list). `cmp_rladmin` gained cluster-health, problem-node, and per-DB status/replication/declared-shards/version comparisons; capture/diff render a richer rladmin summary (cluster health + problem counts), a per-DB table, and PROBLEM nodes/shards tables. Validated against the user's real 5-node / 6-db cluster output.
 - **Per-shard detail + problem-shard detection via `rladmin status extra all`** — switched the exec to `rladmin status extra all` and made the SHARDS parser header-driven (reads the column row, so it adapts to the RE version's columns). Now captures per-shard `USED_MEMORY`, `BACKUP_PROGRESS`, `RAM_FRAG`, `WATCHDOG_STATUS`, `STATUS`, node, role, and slots. Any shard whose `STATUS` or `WATCHDOG_STATUS` is not OK is collected into a `problem_shards` list (db, shard id, node, role, status, watchdog) — exactly the "find the slave shard on node:2 that's causing the issue" workflow. Capture prints a red `PROBLEM shards` table; the diff flags `PROBLEM SHARDS: N → M` as critical with an example. Full per-shard detail is kept in the snapshot/export YAML.
@@ -552,7 +553,7 @@ A running log of changes made via Claude Code. Newest entries on top.
 - **Expanded `capture`/`diff` coverage with 9 more kinds + Custom Resources** — previously `capture`/`diff` only covered 22 categories (some kinds were export-only). Added to the before/after diff: **DaemonSet, Job, ServiceAccount, LimitRange, Role** (namespaced) and **ClusterRole, ClusterRoleBinding, IngressClass, PriorityClass** (cluster-scoped) — all with NEW / MISSING / field-drift detection and noise-stripped `spec_hash` gating. Each got an extractor + comparator (e.g. DaemonSet flags `NOT FULLY SCHEDULED`, PriorityClass flags `value`/`globalDefault` changes, ServiceAccount tracks `imagePullSecrets`/`automount` but ignores auto-generated token secrets). Jobs spawned by CronJobs and `system:*`/built-in cluster objects are filtered as noise. **Custom Resources** are now also diffable via `capture --include-custom-resources` (auto-discovers CRDs, hashes each CR's declared state, skips status churn) — shown in a dedicated `[CR] CUSTOM RESOURCES` table; both pre and post captures must use the flag (same pattern as `--include-secrets`). New `diff_custom_resources_table`; `diff_snapshots` reads new keys defensively with `.get()` so it still compares older snapshots.
 - **Diff "Name" column now names the resource kind** — each diff table's Name column header reads the actual Kind (e.g. `Deployment Name`, `ConfigMap Name`, `Service Name`) instead of a generic `Name`, so it's clear what the listed names are. Driven by a `SECTION_KIND` title→kind map; unknown sections fall back to `Name`.
 - **`diff` now hides unchanged resource categories by default** — previously the report printed a "No changes" table for every one of the 22 categories, burying the actual findings. The three table builders (`diff_ns_scoped_table`, `diff_cluster_scoped_table`, `diff_pods_table`) now also return a findings count, and `diff_snapshots` only prints tables (and their layer header) when there's at least one change. If nothing changed anywhere, it prints a single `✓ No changes detected` line. Use `--show-unchanged` to restore the full all-categories output. The PASS/FAIL verdict and exit code are unaffected.
-- **Corrected stale filename/version references in README** — the Quick-start (`capture`/`diff`) examples and the CI/CD snippet still referenced the legacy `cluster_upgrade_snapshot.py`; updated all of them to the actual `cluster_upgrade_snapshot_v5.py`. Also bumped the title from `(v4)` to `(v5)` to match `__version__ = 5.0.0`.
+- **Corrected stale filename/version references in README** — the Quick-start (`capture`/`diff`) examples and the CI/CD snippet still referenced a legacy filename; updated all of them to the actual script filename at the time (`cluster_upgrade_snapshot_v5.py`). Also bumped the title from `(v4)` to `(v5)` to match `__version__ = 5.0.0`. *(The file was later renamed to `cluster_upgrade_snapshot.py` — see the entry above.)*
 - **Export now covers Custom Resources + cluster-scoped objects (near-full backup)** — the `export` command was extended beyond the 18 curated namespaced kinds. It now (a) auto-discovers every Custom Resource by listing the cluster's CRDs and dumping each CR's storage version across all namespaces (operator-managed objects: cert-manager, ArgoCD, Prometheus, vendor CRs, etc.), and (b) exports cluster-scoped objects — Namespace, ClusterRole, ClusterRoleBinding, StorageClass, PriorityClass, IngressClass, CustomResourceDefinition, and cluster-scoped CRs — into a top-level `_cluster-scoped/` folder. Both are ON by default; opt out with `--no-custom-resources` / `--no-cluster-scoped` (the latter is auto-skipped when `--namespace` targets a single namespace). Cluster-managed defaults (`system:*` ClusterRoles, built-in PriorityClasses) are filtered out; Nodes/PVs are intentionally excluded as environment-specific. CRD kinds that can't be listed (aggregated API down, RBAC, conversion webhook) are counted as "unavailable" and skipped rather than aborting. Needs broader read RBAC than the curated export.
 - **Suppressed repeated `InsecureRequestWarning` spam** — when the kubeconfig sets `insecure-skip-tls-verify` (common on internal OCP clusters with self-signed certs), urllib3 printed a multi-line warning on *every* API call, flooding the output. `load_kube_config()` now disables that one warning — but only when TLS verification is actually off — and prints a single grey notice instead, so the security trade-off stays visible. Verification-enabled clusters are unaffected.
 - **Fixed Python 3.6 compatibility (`TypeError: __init__() got an unexpected keyword argument 'required'`)** — `argparse.add_subparsers()` only accepts `required=` on Python 3.7+, but RHEL/OCP nodes commonly ship Python 3.6.8. Now sets `sub.required = True` via the attribute instead of the constructor kwarg, so the script runs on 3.6 as well. (The `required=True` args on individual `add_argument()` calls are fine on all versions.)
@@ -564,5 +565,5 @@ A running log of changes made via Claude Code. Newest entries on top.
 
 ### 2026-05-27
 - **Added `requirements.txt`** — pins the two third-party Python dependencies (`kubernetes>=28.1.0`, `rich>=13.0.0`) so the project can be installed with `pip install -r requirements.txt`. `hash_helper.py` is a local module and is not listed.
-- **Updated installation instructions** — README now points to `pip3 install -r requirements.txt` and references the actual script filename (`cluster_upgrade_snapshot_v5.py`) instead of the legacy name.
+- **Updated installation instructions** — README now points to `pip3 install -r requirements.txt` and references the actual script filename (`cluster_upgrade_snapshot_v5.py` at the time) instead of the legacy name.
 - **Added this "Tasks Performed" section** — going forward, every change made through Claude Code will be logged here so the history stays understandable.
